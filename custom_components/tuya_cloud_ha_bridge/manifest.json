@@ -1,6 +1,6 @@
 {
   "domain": "tuya_cloud_ha_bridge",
-  "name": "tuya_cloud_ha_bridge",
+  "name": "Tuya Cloud HA Bridge",
   "codeowners": [
     "@tiankuosun"
   ],
