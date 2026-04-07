@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/tiankuosun/tuya_cloud_ha_bridge@main/custom_components/tuya_cloud_ha_bridge/brand/logo.png" alt="tuya_cloud_ha_bridge" width="240" />
-</p>
-
 # tuya_cloud_ha_bridge
 
 tuya_cloud_ha_bridge is a new Home Assistant (HA) plugin officially released by Tuya. Leveraging this plugin, users can synchronize devices from Home Assistant to the Tuya App via a QR code authorization process. Through the App, users can access a range of features—including device management, bidirectional device control, voice control, and scene automation—thereby enabling developers to conveniently manage smart home devices across both the Tuya ecosystem and Home Assistant.
@@ -28,18 +24,16 @@ tuya_cloud_ha_bridge is a new Home Assistant (HA) plugin officially released by 
 
 ### Installation config
 
-1. Official URL to apply for a Tuya API Key: https://tuya.ai/
+1. Official URL to apply for a Tuya API Key: [https://tuya.ai/](https://tuya.ai/)
 2. Download and install "Tuya Smart Life" or the "Tuya" app
 3. Enter your API Key to generate a QR code. Scan the code using the App, then click the Submit button to complete the process
-
-
-
-
 
 ## Home Assistant Version
 
 Home Assistant Version 2026.2.+
 
-## 许可证
 
+
+
+# LICENSE
 [MIT License](LICENSE)

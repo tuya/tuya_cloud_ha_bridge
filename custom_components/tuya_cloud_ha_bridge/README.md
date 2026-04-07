@@ -33,13 +33,10 @@ tuya_cloud_ha_bridge is a new Home Assistant (HA) plugin officially released by 
 3. Enter your API Key to generate a QR code. Scan the code using the App, then click the Submit button to complete the process
 
 
-
-
-
 ## Home Assistant Version
 
 Home Assistant Version 2026.2.+
 
-## 许可证
+# LICENSE
 
 [MIT License](LICENSE)
