@@ -4,7 +4,7 @@
 
 # tuya_cloud_ha_bridge
 
-tuya_cloud_ha_bridge 是一个 Home Assistant 自定义集成，通过涂鸦 Tuya Link 协议将 HA 设备桥接到涂鸦云平台，实现双向控制。
+tuya_cloud_ha_bridge 是一个 Home Assistant 自定义集成，通过涂鸦 Tuya Link 协议将 HA 设备桥接到涂鸦云平台， 实现双向控制。
 
 ## 功能
 
