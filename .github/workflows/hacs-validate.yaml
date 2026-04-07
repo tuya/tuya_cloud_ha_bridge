@@ -1,0 +1,19 @@
+name: HACS Validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+          # 如果你的集成不在根目录（不常见），可指定路径：
+          # repository_directory: "custom_components/my_integration"
