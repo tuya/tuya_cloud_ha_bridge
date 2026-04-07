@@ -1,0 +1,32 @@
+rules:
+  # Bronze
+  action-setup:
+    status: exempt
+    comment: Hub integration; no platform entities yet.
+  appropriate-polling:
+    status: exempt
+    comment: Hub; no polling entities.
+  brands: done
+  common-modules: done
+  config-flow: done
+  config-flow-test-coverage:
+    status: exempt
+    comment: Tests to be added.
+  dependency-transparency: done
+  docs-actions: done
+  docs-high-level-description: done
+  docs-installation-instructions: done
+  docs-removal-instructions: done
+  entity-event-setup:
+    status: exempt
+    comment: Hub only; no entities yet.
+  entity-unique-id:
+    status: exempt
+    comment: Hub only; no entities yet.
+  has-entity-name:
+    status: exempt
+    comment: Hub only; no entities yet.
+  runtime-data: done
+  test-before-configure: done
+  test-before-setup: done
+  unique-config-entry: done

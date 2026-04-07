@@ -1,0 +1,103 @@
+{
+    "config": {
+        "abort": {
+            "already_configured": "Service is already configured",
+            "reconfigure_successful": "Operation complete,please add sub-devices on the gateway panel in the app\n\nDevice name: {device_name}\nDevice ID: {device_id}"
+        },
+        "create_entry": {
+            "default": "Operation successful"
+        },
+        "error": {
+            "api_key_required": "Please enter an API key",
+            "unsupported_region": "The region of this API key is not supported",
+            "cannot_connect_mqtt": "The gateway could not connect to Tuya MQTT service. Please check the network and try again",
+            "cannot_create_gateway": "Failed to create the gateway device via Tuya Cloud. Please try again later",
+            "cannot_decode_qr": "Failed to generate QR code data"
+        },
+        "step": {
+            "bind_gateway": {
+                "data": {
+                    "qr_code": "Binding QR code"
+                },
+                "data_description": {
+                    "qr_code": "Scan this QR code with the Tuya app to complete binding, then select \"Submit\""
+                },
+                "description": "Gateway details:\nName: `{device_name}`\nDevice ID: `{device_id}`\nSub-device limit: **{sub_device_limit}**\n\n**After scanning the QR code to add the gateway, select \"Submit\" to complete setup and add sub-devices in the app (please use App version 7.6.0 or above to scan and add)**\n\n\u26a0\ufe0f Closing this page without selecting \"Submit\" will prevent the gateway from functioning properly in the app",
+                "title": "Scan binding QR code"
+            },
+            "gateway_success": {
+                "description": "Operation complete,please add sub-devices on the gateway panel in the app\n\nDevice name: `{device_name}`\nDevice ID: `{device_id}`",
+                "title": "Operation successful"
+            },
+            "user": {
+                "data": {
+                    "api_key": "API key"
+                },
+                "data_description": {
+                    "api_key": "Paste the API key obtained from the Tuya Cloud platform"
+                },
+                "description": "Create a virtual gateway device and bind it in the Tuya app.\n\nSteps:\n1. Open the Tuya API key guide: {guide_url}\n2. Copy the API key from the Tuya Cloud platform\n3. Enter the API key below and select submit\n\nAfter submission, a gateway device will be created via Tuya Cloud and a binding QR code will be generated.",
+                "title": "Set up virtual gateway"
+            }
+        }
+    },
+    "options": {
+        "error": {
+            "api_key_required": "Please enter an API key",
+            "unsupported_region": "The region of this API key is not supported",
+            "cannot_connect_mqtt": "The gateway could not connect to Tuya MQTT service. Please check the network and try again",
+            "cannot_create_gateway": "Failed to create the gateway device via Tuya Cloud. Please try again later",
+            "cannot_decode_qr": "Failed to generate QR code data"
+        },
+        "step": {
+            "bind_gateway": {
+                "data": {
+                    "qr_code": "Binding QR code"
+                },
+                "data_description": {
+                    "qr_code": "Scan this QR code with the Tuya app to complete binding, then select \"Submit\""
+                },
+                "description": "Gateway details:\nName: `{device_name}`\nDevice ID: `{device_id}`\nSub-device limit: **{sub_device_limit}**\n\n**After scanning the QR code to add the gateway, select \"Submit\" to complete setup and add sub-devices in the app (please use App version 7.6.0 or above to scan and add)**\n\n\u26a0\ufe0f Closing this page without selecting \"Submit\" will prevent the gateway from functioning properly in the app",
+                "title": "Scan binding QR code"
+            },
+            "gateway_success": {
+                "description": "Operation complete,please add sub-devices on the gateway panel in the app\n\nDevice name: `{device_name}`\nDevice ID: `{device_id}`",
+                "title": "Operation successful"
+            },
+            "gateway_details": {
+                "data": {
+                    "api_key": "API key"
+                },
+                "data_description": {
+                    "api_key": "Paste the API key obtained from the Tuya Cloud platform"
+                },
+                "description": "No gateway has been configured for this integration.\n\nSteps:\n1. Open the Tuya API key guide: {guide_url}\n2. Copy the API key from the Tuya Cloud platform\n3. Enter the API key below and select submit",
+                "title": "Set up virtual gateway"
+            },
+            "manage_gateway": {
+                "description": "A gateway is bound to this integration.\n\nDevice name: `{device_name}`\nDevice ID: `{device_id}`",
+                "title": "Virtual gateway"
+            }
+        }
+    },
+    "services": {
+        "execute_standard_command": {
+            "description": "Execute a standard command for a bound Home Assistant entity.",
+            "fields": {
+                "command": {
+                    "description": "The standard command to execute",
+                    "name": "Command"
+                },
+                "config_entry_id": {
+                    "description": "The `tuya_cloud_ha_bridge` config entry that owns the virtual gateway",
+                    "name": "Config entry ID"
+                },
+                "parameters": {
+                    "description": "Command parameters (optional)",
+                    "name": "Parameters"
+                }
+            },
+            "name": "Execute standard command"
+        }
+    }
+}

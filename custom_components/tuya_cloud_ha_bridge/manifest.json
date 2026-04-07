@@ -1,0 +1,16 @@
+{
+  "domain": "tuya_cloud_ha_bridge",
+  "name": "tuya_cloud_ha_bridge",
+  "codeowners": [
+    "@tuya_cloud_ha_bridge"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/tiankuosun/tuya_cloud_ha_bridge",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "quality_scale": "bronze",
+  "requirements": [
+    "paho-mqtt==2.1.0"
+  ],
+  "version": "1.0.0"
+}

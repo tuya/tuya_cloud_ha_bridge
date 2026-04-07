@@ -1,0 +1,7 @@
+{
+  "services": {
+    "execute_standard_command": {
+      "service": "mdi:toggle-switch"
+    }
+  }
+}

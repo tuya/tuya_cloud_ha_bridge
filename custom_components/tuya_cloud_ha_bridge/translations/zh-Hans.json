@@ -1,0 +1,103 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "服务已配置",
+      "reconfigure_successful": "操作完成，请在 App 网关面板添加子设备\n\n设备名称：{device_name}\n设备 ID：{device_id}"
+    },
+    "create_entry": {
+      "default": "操作成功"
+    },
+    "error": {
+      "api_key_required": "请输入 API Key",
+      "unsupported_region": "该 API Key 所属区域暂不支持",
+      "cannot_create_gateway": "通过涂鸦云创建网关设备失败，请稍后重试",
+      "cannot_connect_mqtt": "网关无法连接涂鸦 MQTT 服务，请检查网络后重试",
+      "cannot_decode_qr": "二维码数据生成失败"
+    },
+    "step": {
+      "user": {
+        "data": {
+          "api_key": "API Key"
+        },
+        "data_description": {
+          "api_key": "请粘贴从涂鸦云平台获取的 API Key"
+        },
+        "description": "通过此向导创建虚拟网关设备并在涂鸦 App 中完成绑定。\n\n操作步骤：\n1. 打开涂鸦 API Key 获取指南：{guide_url}\n2. 从涂鸦云平台复制 API Key\n3. 在下方输入 API Key 并点击提交\n\n提交后将调用涂鸦云创建网关设备，并生成绑定二维码。",
+        "title": "配置虚拟网关"
+      },
+      "bind_gateway": {
+        "description": "网关信息：\n名称：`{device_name}`\n设备 ID：`{device_id}`\n子设备上限：**{sub_device_limit}**\n\n**扫码添加网关后，点击「提交」即可结束配置，并在 App 上给网关添加子设备（请使用不低于7.6.0版本的App扫码添加）**\n\n⚠️ 未点击「提交」直接关闭页面，App 端网关将无法正常使用",
+        "title": "扫描绑定二维码",
+        "data": {
+          "qr_code": "绑定二维码"
+        },
+        "data_description": {
+          "qr_code": "请使用涂鸦 App 扫描此二维码完成绑定，确认绑定成功后点击「提交」"
+        }
+      },
+      "gateway_success": {
+        "description": "操作完成，请在 App 网关面板添加子设备\n\n设备名称：`{device_name}`\n设备 ID：`{device_id}`",
+        "title": "操作成功"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "gateway_details": {
+        "data": {
+          "api_key": "API Key"
+        },
+        "data_description": {
+          "api_key": "请粘贴从涂鸦云平台获取的 API Key"
+        },
+        "description": "当前集成尚未配置网关。\n\n操作步骤：\n1. 打开涂鸦 API Key 获取指南：{guide_url}\n2. 从涂鸦云平台复制 API Key\n3. 在下方输入 API Key 并点击提交",
+        "title": "配置虚拟网关"
+      },
+      "manage_gateway": {
+        "description": "当前集成已绑定网关。\n\n设备名称：`{device_name}`\n设备 ID：`{device_id}`",
+        "title": "虚拟网关"
+      },
+      "bind_gateway": {
+        "description": "网关信息：\n名称：`{device_name}`\n设备 ID：`{device_id}`\n子设备上限：**{sub_device_limit}**\n\n**扫码添加网关后，点击「提交」即可结束配置，并在 App 上给网关添加子设备（请使用不低于7.6.0版本的App扫码添加）**\n\n⚠️ 未点击「提交」直接关闭页面，App 端网关将无法正常使用",
+        "title": "扫描绑定二维码",
+        "data": {
+          "qr_code": "绑定二维码"
+        },
+        "data_description": {
+          "qr_code": "请使用涂鸦 App 扫描此二维码完成绑定，确认绑定成功后点击「提交」"
+        }
+      },
+      "gateway_success": {
+        "description": "操作完成，请在 App 网关面板添加子设备\n\n设备名称：`{device_name}`\n设备 ID：`{device_id}`",
+        "title": "操作成功"
+      }
+    },
+    "error": {
+      "api_key_required": "请输入 API Key",
+      "unsupported_region": "该 API Key 所属区域暂不支持",
+      "cannot_create_gateway": "通过涂鸦云创建网关设备失败，请稍后重试",
+      "cannot_connect_mqtt": "网关无法连接涂鸦 MQTT 服务，请检查网络后重试",
+      "cannot_decode_qr": "二维码数据生成失败"
+    }
+  },
+  "services": {
+    "execute_standard_command": {
+      "name": "执行标准指令",
+      "description": "对已绑定的 Home Assistant 实体执行标准指令。",
+      "fields": {
+        "config_entry_id": {
+          "name": "配置条目 ID",
+          "description": "拥有虚拟网关的 `tuya_cloud_ha_bridge` 配置条目"
+        },
+        "command": {
+          "name": "指令",
+          "description": "要执行的标准指令"
+        },
+        "parameters": {
+          "name": "参数",
+          "description": "指令参数（可选）"
+        }
+      }
+    }
+  }
+}
