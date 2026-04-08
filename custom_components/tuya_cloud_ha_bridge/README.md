@@ -40,3 +40,4 @@ Home Assistant Version 2026.2.+
 # LICENSE
 
 [MIT License](LICENSE)
+ 
