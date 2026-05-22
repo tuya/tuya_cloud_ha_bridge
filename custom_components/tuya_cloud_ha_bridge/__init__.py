@@ -14,6 +14,7 @@ from homeassistant.helpers.entity import get_capability
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_API_KEY,
+    EVENT_CORE_CONFIG_UPDATE,
     EVENT_STATE_CHANGED,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
@@ -49,9 +50,11 @@ from .mapping_runtime import (
     async_load_pid_mapping_from_cloud,
     build_service_calls_from_tuya,
     build_tuya_properties_from_state,
+    get_category_candidates_for_domain,
     get_product_id_for_domain,
     get_property_metadata,
     has_mapping_module,
+    infer_category_for_entity,
     infer_domain_for_device,
     select_preferred_domain,
 )
@@ -81,6 +84,146 @@ _TOPO_SYNC_SESSIONS = "topo_sync_sessions"
 # popup).
 _INITIAL_SYNC_DELAY_SECONDS = 5
 _TOPO_SYNC_SESSION_TIMEOUT_SECONDS = 30
+_STATE_REPORT_DEBOUNCE_SECONDS = 0.15
+_UNSET = object()
+
+
+def _build_mapping_context(
+    hass: HomeAssistant,
+    runtime_data: TuyaLinkMqttClient | None = None,
+    tuya_device_id: str | None = None,
+) -> dict[str, Any]:
+    """Build context dict for mapping functions (temperature_unit etc.)."""
+    context: dict[str, Any] = {
+        "temperature_unit": hass.config.units.temperature_unit
+    }
+    if (
+        runtime_data is not None
+        and isinstance(tuya_device_id, str)
+        and tuya_device_id
+        and hasattr(runtime_data, "get_last_child_cover_command")
+    ):
+        context["last_cover_control"] = runtime_data.get_last_child_cover_command(
+            tuya_device_id
+        )
+    return context
+
+
+def _mapping_temperature_unit_code(context: dict[str, Any] | None) -> str:
+    """Return the active temperature unit code used by mapping metadata."""
+    if context and context.get("temperature_unit") == "°F":
+        return "f"
+    return "c"
+
+
+def _convert_temperature_value(
+    value: Any,
+    source_unit: str,
+    target_unit: str,
+) -> Any:
+    """Convert a temperature value between Celsius and Fahrenheit."""
+    if not isinstance(value, (int, float)):
+        return value
+    if source_unit == target_unit:
+        return int(round(value))
+    if source_unit == "c" and target_unit == "f":
+        return int(round(value * 9 / 5 + 32))
+    if source_unit == "f" and target_unit == "c":
+        return int(round((value - 32) * 5 / 9))
+    return value
+
+
+def _resolve_property_dp_properties(
+    hass: HomeAssistant,
+    entity_id: str,
+    code: str,
+    metadata: dict[str, dict[str, Any]],
+    context: dict[str, Any] | None = None,
+    *,
+    include_static: bool = True,
+    include_range: bool = True,
+) -> dict[str, Any] | None:
+    """Resolve dpProperties for a Tuya property from mapping metadata."""
+    meta = metadata.get(code, {})
+    if not meta:
+        return None
+
+    target_unit = meta.get("unit")
+    current_unit = _mapping_temperature_unit_code(context)
+
+    dp_properties: dict[str, Any] = {}
+
+    if include_static:
+        static_dp_properties = meta.get("dp_properties")
+        if isinstance(static_dp_properties, dict):
+            dp_properties.update(static_dp_properties)
+
+    range_value: Any | None = None
+    if include_range:
+        if "range_attr" in meta:
+            cap_val = get_capability(hass, entity_id, meta["range_attr"])
+            if isinstance(cap_val, list) and cap_val:
+                range_value = cap_val
+        elif "range" in meta:
+            range_value = meta["range"]
+
+        if range_value is not None:
+            if "value_map" in meta and isinstance(range_value, list):
+                range_value = [meta["value_map"].get(v, v) for v in range_value]
+            dp_properties["range"] = range_value
+
+    attr_map = meta.get("dp_properties_attr_map")
+    if include_static and isinstance(attr_map, dict):
+        for dp_key, attr_name in attr_map.items():
+            cap_val = get_capability(hass, entity_id, attr_name)
+            if cap_val is not None:
+                if (
+                    isinstance(target_unit, str)
+                    and target_unit in {"c", "f"}
+                    and attr_name in {"min_temp", "max_temp"}
+                ):
+                    cap_val = _convert_temperature_value(
+                        cap_val, current_unit, target_unit
+                    )
+                dp_properties[str(dp_key)] = cap_val
+
+    range_values = dp_properties.get("range")
+    if "type" not in dp_properties and isinstance(range_values, (list, tuple)):
+        dp_properties["type"] = "enum"
+
+    return dp_properties or None
+
+
+def _build_default_property_payload(
+    hass: HomeAssistant,
+    entity_id: str,
+    code: str,
+    metadata: dict[str, dict[str, Any]],
+    context: dict[str, Any] | None = None,
+    value: Any = _UNSET,
+) -> dict[str, Any]:
+    """Build a sub/bind defaultProperties item."""
+    meta = metadata.get(code, {})
+    prop: dict[str, Any] = {
+        "code": code,
+    }
+    if "bind_value" in meta:
+        prop["value"] = meta["bind_value"]
+    elif value is not _UNSET:
+        prop["value"] = value
+
+    if dp_properties := _resolve_property_dp_properties(
+        hass,
+        entity_id,
+        code,
+        metadata,
+        context,
+        include_static=True,
+        include_range=True,
+    ):
+        prop["dpProperties"] = dp_properties
+
+    return prop
 
 
 @dataclass(slots=True)
@@ -215,29 +358,47 @@ async def _async_report_subdevices_online(
     client: TuyaLinkMqttClient,
     child_device_ids: list[str] | None = None,
 ) -> None:
-    """Report bound child devices online through the gateway."""
+    """Report bound child devices online through the gateway.
+
+    Only devices whose HA entities are currently available are reported
+    online; unavailable devices are reported offline so the Tuya cloud
+    status stays in sync with HA.
+    """
     if entry.runtime_data is not client:
         return
 
-    if child_device_ids is None:
-        bindings = await async_load_gateway_bindings(hass, entry.entry_id)
-        if not bindings:
-            return
-        child_device_ids = [
-            tuya_device_id
-            for device_data in bindings.get("devices", {}).values()
-            if isinstance(
-                tuya_device_id := device_data.get("tuya_device_id"),
-                str,
-            )
-            and tuya_device_id
-        ]
-
-    if not child_device_ids:
+    bindings = await async_load_gateway_bindings(hass, entry.entry_id)
+    if not bindings:
         return
 
-    # Preserve order while avoiding duplicate online reports.
-    client.publish_subdevice_login(list(dict.fromkeys(child_device_ids)))
+    if child_device_ids is None:
+        candidate_devices = bindings.get("devices", {})
+    else:
+        candidate_ids = set(child_device_ids)
+        candidate_devices = {
+            dev_id: dev_data
+            for dev_id, dev_data in bindings.get("devices", {}).items()
+            if isinstance(dev_data, dict)
+            and dev_data.get("tuya_device_id") in candidate_ids
+        }
+
+    online_ids: list[str] = []
+    offline_ids: list[str] = []
+    for device_id, device_data in candidate_devices.items():
+        if not isinstance(device_data, dict):
+            continue
+        tuya_device_id = device_data.get("tuya_device_id")
+        if not isinstance(tuya_device_id, str) or not tuya_device_id:
+            continue
+        if _device_is_available_for_bindings(hass, bindings, device_id):
+            online_ids.append(tuya_device_id)
+        else:
+            offline_ids.append(tuya_device_id)
+
+    if online_ids:
+        client.publish_subdevice_login(list(dict.fromkeys(online_ids)))
+    if offline_ids:
+        client.publish_subdevice_logout(list(dict.fromkeys(offline_ids)))
 
 
 async def _async_report_all_bound_device_states(
@@ -285,11 +446,14 @@ async def _async_report_all_bound_device_states(
                 continue
             domain = str(entity_data["domain"])
 
-        await async_ensure_mapping_module_loaded(hass, domain)
-        properties = build_tuya_properties_from_state(domain, entity_state)
+        category_code = device_data.get("category_code") or None
+        await async_ensure_mapping_module_loaded(hass, domain, category_code)
+        context = _build_mapping_context(hass, client, tuya_device_id)
+        properties = build_tuya_properties_from_state(
+            domain, entity_state, category_code, context=context
+        )
         if not properties:
             continue
-
         await hass.async_add_executor_job(
             client.publish_child_property_report,
             tuya_device_id,
@@ -349,6 +513,24 @@ def _device_bound_domain(
 
     domain = entity_data.get("domain")
     return domain if isinstance(domain, str) and domain else None
+
+
+def _device_bound_category_code(
+    bindings: dict[str, Any], device_data: dict[str, Any]
+) -> str:
+    """Return the category_code for a bound device (empty string if unset)."""
+    if isinstance(cat := device_data.get("category_code"), str):
+        return cat
+
+    if not (entity_id := _device_primary_entity_id(device_data)):
+        return ""
+
+    entity_data = bindings.get("entities", {}).get(entity_id)
+    if not isinstance(entity_data, dict):
+        return ""
+
+    cat = entity_data.get("category_code", "")
+    return cat if isinstance(cat, str) else ""
 
 
 def _device_is_available_for_bindings(
@@ -431,6 +613,10 @@ async def _async_handle_bound_entity_availability_change(
     runtime_data.publish_subdevice_logout([tuya_device_id])
 
 
+_pending_device_reports: dict[str, asyncio.TimerHandle] = {}
+_pending_device_old_states: dict[str, State] = {}
+
+
 async def _async_report_bound_entity_state_change(
     hass: HomeAssistant,
     entry: TuyaHaNewConfigEntry,
@@ -438,7 +624,31 @@ async def _async_report_bound_entity_state_change(
     old_state: State | None,
     new_state: State | None,
 ) -> None:
-    """Publish an immediate child-device batch report for state changes."""
+    """Schedule a coalescing child-device property report for state changes.
+
+    HA may split a single logical update into multiple rapid
+    EVENT_STATE_CHANGED events (e.g. a cover's ``current_position``
+    attribute changes in one event and its ``state`` changes in the
+    next, both within the same millisecond).  Publishing each event
+    independently can produce contradictory MQTT messages (position=0
+    but work_state=closing).
+
+    To fix this without blocking ongoing dynamic updates (e.g. a cover
+    moving from 0 % to 100 %), we use a *fixed-delay coalesce* strategy
+    per tuya_device_id:
+
+    * On the **first** event for a device, start a short timer and
+      record the original old_state.
+    * On **subsequent** events that arrive before the timer fires, do
+      **not** reset the timer — just let it fire on schedule.
+    * When the timer fires, read the **current** entity state from HA
+      (which by then includes all attributes that were being updated)
+      and publish a single consistent report.
+
+    This gives HA ~150 ms to settle all attributes of a single logical
+    change, while still reporting every subsequent position tick
+    faithfully.
+    """
     runtime_data = getattr(entry, "runtime_data", None)
     if (
         runtime_data is None
@@ -483,43 +693,98 @@ async def _async_report_bound_entity_state_change(
     if not isinstance(tuya_device_id, str) or not tuya_device_id:
         return
 
-    await async_ensure_mapping_module_loaded(hass, domain)
+    category_code = _device_bound_category_code(bindings, device_data) or None
+    await async_ensure_mapping_module_loaded(hass, domain, category_code)
+
+    report_key = f"{entry.entry_id}:{tuya_device_id}"
+
+    if report_key not in _pending_device_old_states:
+        _pending_device_old_states[report_key] = old_state
+
+    if report_key in _pending_device_reports:
+        LOGGER.debug(
+            "Coalesce: timer already pending for tuya_device_id=%s, "
+            "latest state will be picked up on flush",
+            tuya_device_id,
+        )
+        return
+
+    handle = hass.loop.call_later(
+        _STATE_REPORT_DEBOUNCE_SECONDS,
+        lambda: hass.async_create_task(
+            _async_flush_device_report(
+                hass,
+                entry,
+                report_key,
+                entity_id,
+                tuya_device_id,
+                domain,
+                category_code,
+            )
+        ),
+    )
+    _pending_device_reports[report_key] = handle
+
+
+async def _async_flush_device_report(
+    hass: HomeAssistant,
+    entry: TuyaHaNewConfigEntry,
+    report_key: str,
+    entity_id: str,
+    tuya_device_id: str,
+    domain: str,
+    category_code: str | None,
+) -> None:
+    """Publish the debounced property report using the latest entity state."""
+    _pending_device_reports.pop(report_key, None)
+    first_old_state = _pending_device_old_states.pop(report_key, None)
+
+    runtime_data = getattr(entry, "runtime_data", None)
+    if runtime_data is None or not hasattr(
+        runtime_data, "publish_child_property_report"
+    ):
+        return
+
+    current_state = hass.states.get(entity_id)
+    if current_state is None or not _state_can_be_reported(current_state):
+        return
 
     LOGGER.debug(
-        "Evaluating bound entity change entity_id=%s device_id=%s "
-        "tuya_device_id=%s old_state=%s new_state=%s",
+        "Debounce flush entity_id=%s tuya_device_id=%s state=%s",
         entity_id,
-        device_id,
         tuya_device_id,
-        old_state.state,
-        new_state.state,
+        current_state.state,
     )
 
-    if not (new_properties := build_tuya_properties_from_state(domain, new_state)):
+    context = _build_mapping_context(hass, runtime_data, tuya_device_id)
+    new_properties = build_tuya_properties_from_state(
+        domain, current_state, category_code, context=context
+    )
+    if not new_properties:
         return
 
     old_properties = (
-        build_tuya_properties_from_state(domain, old_state)
-        if _state_can_be_reported(old_state)
+        build_tuya_properties_from_state(
+            domain, first_old_state, category_code, context=context
+        )
+        if first_old_state is not None and _state_can_be_reported(first_old_state)
         else {}
     )
     old_values = _property_values(old_properties)
     new_values = _property_values(new_properties)
     if old_values == new_values:
         LOGGER.debug(
-            "Skipping bound entity report entity_id=%s device_id=%s "
+            "Skipping bound entity report entity_id=%s "
             "tuya_device_id=%s because mapped properties did not change",
             entity_id,
-            device_id,
             tuya_device_id,
         )
         return
 
     LOGGER.debug(
-        "Reporting bound entity state change entity_id=%s device_id=%s "
+        "Reporting bound entity state change entity_id=%s "
         "tuya_device_id=%s old_values=%s new_values=%s",
         entity_id,
-        device_id,
         tuya_device_id,
         old_values,
         new_values,
@@ -591,8 +856,42 @@ async def async_handle_subdevice_bind_response(
         return
 
     code = message.get("code", -1)
+    msg_id = message.get("msgId", "")
+
+    if code == 1001:
+        runtime_data = getattr(entry, "runtime_data", None)
+        if (
+            runtime_data is not None
+            and hasattr(runtime_data, "republish_subdevice_bind")
+            and isinstance(msg_id, str)
+            and msg_id
+            and runtime_data.republish_subdevice_bind(msg_id)
+        ):
+            LOGGER.warning(
+                "Child bind response code=1001 (msgId=%s), retrying once", msg_id
+            )
+            return
+        # Retry not possible (already retried or not found) — clean up and give up.
+        LOGGER.warning("Child bind response rejected (code=%s): %s", code, message)
+        if (
+            runtime_data is not None
+            and hasattr(runtime_data, "pop_pending_bind_request")
+            and isinstance(msg_id, str)
+            and msg_id
+        ):
+            runtime_data.pop_pending_bind_request(msg_id)
+        return
+
     if code != 0:
         LOGGER.warning("Child bind response rejected (code=%s): %s", code, message)
+        runtime_data = getattr(entry, "runtime_data", None)
+        if (
+            runtime_data is not None
+            and hasattr(runtime_data, "pop_pending_bind_request")
+            and isinstance(msg_id, str)
+            and msg_id
+        ):
+            runtime_data.pop_pending_bind_request(msg_id)
         return
 
     response_data = message.get("data", [])
@@ -656,14 +955,19 @@ async def async_handle_subdevice_bind_response(
             )
             continue
 
-        device_name = device.name or device.id
+        device_name = device.name_by_user or device.name or device.id
 
-        # Determine the domain from product_id or existing binding
+        # Determine the domain and category_code from product_id or existing binding
         selected_domain: str | None = None
+        selected_category_code: str = ""
         if isinstance(product_id, str) and product_id:
             for domain in get_supported_domains_in_order():
-                if get_product_id_for_domain(domain) == product_id:
-                    selected_domain = domain
+                for candidate in get_category_candidates_for_domain(domain):
+                    if candidate.product_id == product_id:
+                        selected_domain = domain
+                        selected_category_code = candidate.category_code
+                        break
+                if selected_domain:
                     break
 
         # Fall back to existing binding info if product_id not in response
@@ -671,6 +975,8 @@ async def async_handle_subdevice_bind_response(
             existing_domain = devices_map[client_id].get("domain")
             if isinstance(existing_domain, str) and existing_domain:
                 selected_domain = existing_domain
+                existing_cat = devices_map[client_id].get("category_code", "")
+                selected_category_code = existing_cat if isinstance(existing_cat, str) else ""
 
         if not selected_domain:
             LOGGER.debug(
@@ -720,6 +1026,7 @@ async def async_handle_subdevice_bind_response(
             "entity_ids": selected_entities,
             "primary_entity_id": primary_entity_id,
             "domain": selected_domain,
+            "category_code": selected_category_code,
             "product_id": product_id,
             "client_id": client_id,
             "tuya_device_id": tuya_device_id,
@@ -728,6 +1035,7 @@ async def async_handle_subdevice_bind_response(
             entities_map[eid] = {
                 "device_id": device.id,
                 "domain": selected_domain,
+                "category_code": selected_category_code,
             }
 
         # Associate config entry with the device
@@ -756,6 +1064,15 @@ async def async_handle_subdevice_bind_response(
         await async_save_gateway_bindings(hass, entry.entry_id, bindings)
         if runtime_data is not None and new_tuya_device_ids:
             runtime_data.publish_subdevice_login(new_tuya_device_ids)
+
+    # Clean up the pending bind request now that it has been fully processed.
+    if (
+        runtime_data is not None
+        and hasattr(runtime_data, "pop_pending_bind_request")
+        and isinstance(msg_id, str)
+        and msg_id
+    ):
+        runtime_data.pop_pending_bind_request(msg_id)
 
     if responded_client_ids:
         if stored_pending_client_ids := pending_bind_clients.get(entry.entry_id):
@@ -1442,14 +1759,19 @@ async def async_handle_topo_get_response(
             )
             continue
 
-        device_name = device.name or device.id
+        device_name = device.name_by_user or device.name or device.id
 
-        # Determine the domain from product_id.
+        # Determine the domain and category_code from product_id.
         selected_domain: str | None = None
+        selected_category_code: str = ""
         if isinstance(product_id, str) and product_id:
             for domain in get_supported_domains_in_order():
-                if get_product_id_for_domain(domain) == product_id:
-                    selected_domain = domain
+                for candidate in get_category_candidates_for_domain(domain):
+                    if candidate.product_id == product_id:
+                        selected_domain = domain
+                        selected_category_code = candidate.category_code
+                        break
+                if selected_domain:
                     break
 
         if not selected_domain:
@@ -1496,6 +1818,7 @@ async def async_handle_topo_get_response(
             "entity_ids": selected_entities,
             "primary_entity_id": primary_entity_id,
             "domain": selected_domain,
+            "category_code": selected_category_code,
             "product_id": product_id,
             "client_id": client_id,
             "tuya_device_id": tuya_device_id,
@@ -1504,6 +1827,7 @@ async def async_handle_topo_get_response(
             entities_map[eid] = {
                 "device_id": device.id,
                 "domain": selected_domain,
+                "category_code": selected_category_code,
             }
 
         # Associate config entry with the device.
@@ -1615,24 +1939,68 @@ async def async_publish_eligible_ha_devices(
                     has_available_entity = True
 
         if not entity_domains or not has_available_entity:
+            LOGGER.debug(
+                "publish_eligible: skip device %s (%s): entity_domains=%s has_available=%s",
+                device.id, device.name, entity_domains, has_available_entity,
+            )
             continue
 
         # Pick the highest-priority domain, then check cloud PID mapping.
+        from .mapping_runtime import _PID_MAPPING_CACHE
         selected_domain = infer_domain_for_device(entity_domains)
         if not selected_domain:
+            LOGGER.debug(
+                "publish_eligible: skip device %s (%s): infer_domain returned None for domains=%s, "
+                "PID_CACHE_keys=%s",
+                device.id, device.name, entity_domains,
+                list(_PID_MAPPING_CACHE.keys()) if _PID_MAPPING_CACHE else "None",
+            )
             continue
 
-        if not has_mapping_module(selected_domain):
+        if not await async_ensure_mapping_module_loaded(hass, selected_domain):
+            LOGGER.debug(
+                "publish_eligible: skip device %s (%s): no mapping module for domain=%s",
+                device.id, device.name, selected_domain,
+            )
             continue
 
-        product_id = get_product_id_for_domain(selected_domain)
+        # Infer the best category (and thus PID) for this device,
+        # using the same keyword/attribute logic as registry_sync.
+        candidates = get_category_candidates_for_domain(selected_domain)
+        product_id: str | None = None
+        if candidates and len(candidates) > 1:
+            primary_entity_id: str | None = None
+            for entity_entry in er.async_entries_for_device(entity_registry, device.id):
+                if entity_entry.disabled_by is not None:
+                    continue
+                if entity_entry.domain == selected_domain:
+                    primary_entity_id = entity_entry.entity_id
+                    break
+            if primary_entity_id is not None:
+                inferred = infer_category_for_entity(
+                    hass, primary_entity_id, candidates,
+                    device_name=device.name,
+                    device_model=device.model,
+                    device_manufacturer=device.manufacturer,
+                )
+                if inferred is not None:
+                    for c in candidates:
+                        if c.category_code == inferred.category_code:
+                            product_id = c.product_id
+                            break
+        if product_id is None:
+            product_id = get_product_id_for_domain(selected_domain)
         if not product_id:
+            LOGGER.debug(
+                "publish_eligible: skip device %s (%s): no product_id for domain=%s",
+                device.id, device.name, selected_domain,
+            )
             continue
 
         ha_device: dict[str, str] = {
             "productId": product_id,
             "clientId": device.id,
-            "deviceName": device.name or device.id,
+            "deviceName": device.name_by_user or device.name or device.id,
             "deviceType": selected_domain,
         }
 
@@ -1643,6 +2011,10 @@ async def async_publish_eligible_ha_devices(
 
         ha_devices.append(ha_device)
 
+    LOGGER.debug(
+        "publish_eligible: total_devices=%d, eligible=%d",
+        len(device_registry.devices), len(ha_devices),
+    )
     runtime_data.publish_ha_devices(ha_devices)
 
 
@@ -1709,13 +2081,18 @@ async def async_handle_subdevice_to_bind(
             LOGGER.debug("topo/add/notify: device not found for clientId=%s", client_id)
             continue
 
-        device_name = device.name or device.id
+        device_name = device.name_by_user or device.name or device.id
 
-        # Find the matching domain for this product_id
+        # Find the matching domain and category_code for this product_id
         selected_domain: str | None = None
+        selected_category_code: str = ""
         for domain in get_supported_domains_in_order():
-            if get_product_id_for_domain(domain) == product_id:
-                selected_domain = domain
+            for candidate in get_category_candidates_for_domain(domain):
+                if candidate.product_id == product_id:
+                    selected_domain = domain
+                    selected_category_code = candidate.category_code
+                    break
+            if selected_domain:
                 break
 
         if not selected_domain:
@@ -1747,12 +2124,16 @@ async def async_handle_subdevice_to_bind(
 
         # Build defaultProperties from current entity state
         default_properties: list[dict[str, Any]] = []
-        await async_ensure_mapping_module_loaded(hass, selected_domain)
-        metadata = get_property_metadata(selected_domain)
+        topo_category_code = selected_category_code or None
+        await async_ensure_mapping_module_loaded(hass, selected_domain, topo_category_code)
+        metadata = get_property_metadata(selected_domain, topo_category_code)
         entity_state = hass.states.get(primary_entity_id)
+        context = _build_mapping_context(hass)
         reported_codes: set[str] = set()
         if entity_state is not None and _state_can_be_reported(entity_state):
-            properties = build_tuya_properties_from_state(selected_domain, entity_state)
+            properties = build_tuya_properties_from_state(
+                selected_domain, entity_state, topo_category_code, context=context
+            )
             if properties:
                 for k, v in properties.items():
                     reported_codes.add(k)
@@ -1761,40 +2142,32 @@ async def async_handle_subdevice_to_bind(
                     # Apply value_map to convert Tuya values to HA values
                     if "value_map" in meta:
                         value = meta["value_map"].get(value, value)
-                    prop: dict[str, Any] = {"code": k, "value": value}
-                    # range: use get_capability to resolve from state or
-                    # entity registry, ensuring range is available even when
-                    # state attributes have not been populated yet.
-                    if "range_attr" in meta:
-                        cap_val = get_capability(
-                            hass, primary_entity_id, meta["range_attr"]
-                        )
-                        if isinstance(cap_val, list) and cap_val:
-                            prop["range"] = cap_val
-                    elif "range" in meta:
-                        prop["range"] = meta["range"]
+                    prop = _build_default_property_payload(
+                        hass,
+                        primary_entity_id,
+                        k,
+                        metadata,
+                        context,
+                        value,
+                    )
                     default_properties.append(prop)
 
         # Append metadata-defined properties not already reported by
         # ha_to_tuya (e.g. mode when the entity state lacks that attribute)
-        # so that Tuya cloud still receives their range.
+        # so that Tuya cloud still receives their dpProperties.
         if metadata:
-            for code, meta in metadata.items():
+            for code in metadata:
                 if code in reported_codes:
                     continue
-                if "range_attr" not in meta:
-                    continue
-                cap_val = get_capability(
-                    hass, primary_entity_id, meta["range_attr"]
+                prop = _build_default_property_payload(
+                    hass,
+                    primary_entity_id,
+                    code,
+                    metadata,
+                    context,
                 )
-                if not isinstance(cap_val, list) or not cap_val:
+                if "dpProperties" not in prop:
                     continue
-                prop = {"code": code, "range": cap_val}
-                # Apply value_map so range entries use HA values
-                if "value_map" in meta:
-                    prop["range"] = [
-                        meta["value_map"].get(v, v) for v in cap_val
-                    ]
                 default_properties.append(prop)
 
         bind_child: dict[str, Any] = {
@@ -1832,6 +2205,7 @@ async def _async_send_immediate_property_report(
     domain: str,
     entity_id: str,
     tuya_command_data: dict[str, Any] | None = None,
+    category_code: str | None = None,
 ) -> None:
     """Send an immediate property report for a child device.
 
@@ -1853,20 +2227,22 @@ async def _async_send_immediate_property_report(
     if entity_state is None or not _state_can_be_reported(entity_state):
         return
 
-    await async_ensure_mapping_module_loaded(hass, domain)
-    properties = build_tuya_properties_from_state(domain, entity_state)
+    await async_ensure_mapping_module_loaded(hass, domain, category_code)
+    context = _build_mapping_context(hass, runtime_data, tuya_device_id)
+    properties = build_tuya_properties_from_state(
+        domain, entity_state, category_code, context=context
+    )
     if not properties:
         return
-
     # Override reported values with explicitly commanded properties so the
     # cloud receives the mode/value that was actually requested.
     if tuya_command_data:
         now = int(time.time() * 1000)
-        for key in ("work_mode",):
-            if key in tuya_command_data and key in properties:
+        for key, value in tuya_command_data.items():
+            if key in properties:
                 properties[key] = {
                     "time": now,
-                    "value": tuya_command_data[key],
+                    "value": value,
                 }
 
     LOGGER.debug(
@@ -1916,6 +2292,7 @@ async def async_handle_subdevice_message(
     )
     if ha_device_id is None:
         return
+    runtime_data = getattr(entry, "runtime_data", None)
 
     topic_suffix = "/".join(topic_parts[2:])
     if topic_suffix == "thing/property/set":
@@ -1929,11 +2306,22 @@ async def async_handle_subdevice_message(
             return
         if not (domain := _device_bound_domain(bindings, device_data)):
             return
-        await async_ensure_mapping_module_loaded(hass, domain)
+        category_code = _device_bound_category_code(bindings, device_data) or None
+        await async_ensure_mapping_module_loaded(hass, domain, category_code)
+        if (
+            domain == "cover"
+            and "control" in message["data"]
+            and hasattr(runtime_data, "remember_child_cover_command")
+        ):
+            runtime_data.remember_child_cover_command(
+                tuya_device_id, message["data"]["control"]
+            )
         if service_calls := build_service_calls_from_tuya(
             domain,
             message["data"],
             entity_id,
+            category_code=category_code,
+            context=_build_mapping_context(hass, runtime_data, tuya_device_id),
         ):
             LOGGER.debug(
                 "Routing Tuya child property set tuya_device_id=%s "
@@ -1954,6 +2342,7 @@ async def async_handle_subdevice_message(
             await _async_send_immediate_property_report(
                 hass, entry, tuya_device_id, domain, entity_id,
                 tuya_command_data=message["data"],
+                category_code=category_code,
             )
             return
         LOGGER.debug("Unhandled Tuya child property set: %s", message)
@@ -2096,7 +2485,7 @@ async def async_setup_entry(
         # Gateway not created yet; integration is loaded but no MQTT.
         return True
 
-    # Refresh category-PID mappings from cloud on every setup (restart/reload).
+    # Refresh category_code-PID mappings from cloud on every setup (restart/reload).
     api_key = credentials.get(CONF_API_KEY)
     if isinstance(api_key, str) and api_key:
         await async_load_pid_mapping_from_cloud(hass, api_key)
@@ -2279,6 +2668,24 @@ async def async_setup_entry(
             _async_schedule_registry_resync,
         )
     )
+
+    @callback
+    def _async_on_core_config_update(event: Event) -> None:
+        """Re-report bound device states when the temperature unit changes."""
+        if "unit_system" not in event.data:
+            return
+        LOGGER.debug(
+            "Temperature unit changed (unit_system=%s), re-reporting bound device states",
+            event.data.get("unit_system"),
+        )
+        hass.async_create_task(
+            _async_report_all_bound_device_states(hass, entry, client)
+        )
+
+    entry.async_on_unload(
+        hass.bus.async_listen(EVENT_CORE_CONFIG_UPDATE, _async_on_core_config_update)
+    )
+
     return True
 
 
@@ -2359,6 +2766,14 @@ async def async_unload_entry(
     """Unload a config entry and disconnect MQTT."""
     _get_topo_sync_sessions(hass).pop(entry.entry_id, None)
     _get_pending_bind_clients(hass).pop(entry.entry_id, None)
+
+    prefix = f"{entry.entry_id}:"
+    for key in [k for k in _pending_device_reports if k.startswith(prefix)]:
+        handle = _pending_device_reports.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+        _pending_device_old_states.pop(key, None)
+
     client = getattr(entry, "runtime_data", None)
     if client:
         await hass.async_add_executor_job(client.disconnect)

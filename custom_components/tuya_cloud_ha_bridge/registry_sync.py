@@ -11,9 +11,11 @@ from homeassistant.helpers import entity_registry as er
 from . import TuyaHaNewConfigEntry
 from .const import DOMAIN, LOGGER
 from .mapping_runtime import (
+    async_ensure_mapping_module_loaded,
     async_ensure_pid_mapping_loaded,
+    get_category_candidates_for_domain,
     get_product_id_for_domain,
-    has_mapping_module,
+    infer_category_for_entity,
     infer_domain_for_device,
     select_preferred_domain,
 )
@@ -30,6 +32,7 @@ class BoundEntity:
     entity_id: str
     device_id: str | None
     domain: str
+    category_code: str = ""
 
 
 def _async_entry_domain(hass: HomeAssistant, entry_id: str) -> str | None:
@@ -143,17 +146,20 @@ async def async_sync_gateway_devices(
         if not selected_domain:
             LOGGER.debug(
                 "Skipping non-Tuya device %s: no supported domain inferred",
-                device.name or device.id,
+                device.name_by_user or device.name or device.id,
             )
             continue
 
-        if not has_mapping_module(selected_domain):
+        if not await async_ensure_mapping_module_loaded(hass, selected_domain):
             LOGGER.debug(
                 "Skipping device %s: no mapping module for domain %s",
-                device.name or device.id,
+                device.name_by_user or device.name or device.id,
                 selected_domain,
             )
             continue
+
+        # Get all category candidates for this domain.
+        candidates = get_category_candidates_for_domain(selected_domain)
 
         # Now collect matching entities for the inferred domain.
         for entity_entry in er.async_entries_for_device(entity_registry, device.id):
@@ -163,11 +169,22 @@ async def async_sync_gateway_devices(
                 continue
             if entity_entry.domain != selected_domain:
                 continue
+
+            # Infer category for this entity when multiple candidates exist.
+            inferred = infer_category_for_entity(
+                hass, entity_entry.entity_id, candidates,
+                device_name=device.name,
+                device_model=device.model,
+                device_manufacturer=device.manufacturer,
+            ) if candidates else None
+            entity_category_code = inferred.category_code if inferred else ""
+
             bound_entities.append(
                 BoundEntity(
                     entity_id=entity_entry.entity_id,
                     device_id=device.id,
                     domain=entity_entry.domain,
+                    category_code=entity_category_code,
                 )
             )
 
@@ -184,15 +201,29 @@ async def async_sync_gateway_devices(
 
         selected_entities = bound_entities
         primary_entity = selected_entities[0]
-        product_id = get_product_id_for_domain(selected_domain)
+
+        # Determine product_id and category_code from the primary entity's inference.
+        entity_category_code = primary_entity.category_code
+        if candidates and entity_category_code:
+            # Use the PID from the matched category candidate.
+            product_id: str | None = None
+            for c in candidates:
+                if c.category_code == entity_category_code:
+                    product_id = c.product_id
+                    break
+            if product_id is None:
+                product_id = get_product_id_for_domain(selected_domain)
+        else:
+            product_id = get_product_id_for_domain(selected_domain)
         if product_id is None:
             continue
 
         devices[device.id] = {
-            "name": device.name or device.id,
+            "name": device.name_by_user or device.name or device.id,
             "entity_ids": [bound_entity.entity_id for bound_entity in selected_entities],
             "primary_entity_id": primary_entity.entity_id,
             "domain": selected_domain,
+            "category_code": entity_category_code,
             "product_id": product_id,
             "client_id": device.id,
             "tuya_device_id": previous_bindings.get("devices", {})
@@ -210,6 +241,7 @@ async def async_sync_gateway_devices(
             entities[bound_entity.entity_id] = {
                 "device_id": bound_entity.device_id,
                 "domain": bound_entity.domain,
+                "category_code": bound_entity.category_code,
             }
 
     stale_device_ids = set(previous_bindings.get("devices", {})) - set(devices)

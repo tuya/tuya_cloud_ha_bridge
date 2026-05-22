@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from types import MappingProxyType
 from typing import Any
 
@@ -156,8 +157,20 @@ class _TemporaryGatewayClientMixin:
         """Call OpenAPI to create gateway, then connect MQTT."""
         api_key = gateway_details[CONF_API_KEY]
 
+        # Generate stable clientId from HA instance_id (SHA-256 hash, first 8 hex chars)
+        gateway_client_id: str | None = None
         try:
-            result = await async_create_ha_gateway(self.hass, api_key)
+            from homeassistant.helpers.instance_id import async_get as async_get_instance_id
+
+            instance_id = await async_get_instance_id(self.hass)
+            instance_id_hash = hashlib.sha256(instance_id.encode()).hexdigest()[:8]
+            gateway_client_id = f"ha-gw-{instance_id_hash}"
+            LOGGER.debug("Generated gateway clientId=%s from instance_id", gateway_client_id)
+        except Exception:
+            LOGGER.debug("Failed to generate gateway clientId from instance_id, using cloud default")
+
+        try:
+            result = await async_create_ha_gateway(self.hass, api_key, client_id=gateway_client_id)
         except TuyaOpenApiError as err:
             LOGGER.warning("Tuya OpenAPI gateway creation failed: %s", err)
             return None, "cannot_create_gateway"

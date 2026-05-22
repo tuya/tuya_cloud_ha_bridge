@@ -3,26 +3,26 @@ from typing import Any, Dict
 
 
 # ------------------------------
-# 默认HSV值（灯关闭时上报用）
+# Default HSV values (used when reporting light-off state)
 # ------------------------------
 DEFAULT_HSV = {"h": 0, "s": 0, "v": 0}
 
 
 # ------------------------------
-# 工具函数：数值范围校验
+# Utility function: numeric range validation
 # ------------------------------
 def validate_value(value: Any, min_val: int, max_val: int, param_name: str) -> None:
-    """校验数值是否在指定范围内，超出则抛异常。"""
+    """Validate that a value is within the specified range; raise an exception if out of range."""
     if not (min_val <= value <= max_val):
-        raise ValueError(f"参数{param_name}值{value}超出范围[{min_val}, {max_val}]")
+        raise ValueError(f"Parameter {param_name} value {value} is out of range [{min_val}, {max_val}]")
 
 
 def _validate_tuya_hsv(colour_data: Any) -> dict[str, int]:
-    """校验并返回Tuya HSV彩光数据。"""
+    """Validate and return Tuya HSV color data."""
     if not isinstance(colour_data, dict) or not all(
         key in colour_data for key in ("h", "s", "v")
     ):
-        raise ValueError("colour_data格式错误，需包含h/s/v键")
+        raise ValueError("colour_data format error, must contain h/s/v keys")
 
     hsv_data = {
         "h": int(colour_data["h"]),
@@ -36,28 +36,28 @@ def _validate_tuya_hsv(colour_data: Any) -> dict[str, int]:
 
 
 def _validate_ha_hs_color(hs_color: Any) -> tuple[float, float]:
-    """校验并返回HA hs_color。"""
+    """Validate and return HA hs_color."""
     if not isinstance(hs_color, (list, tuple)) or len(hs_color) != 2:
-        raise ValueError("hs_color格式错误，需包含h/s两个值")
+        raise ValueError("hs_color format error, must contain two values: h and s")
 
     hue = float(hs_color[0])
     saturation = float(hs_color[1])
     if not 0 <= hue <= 360:
-        raise ValueError(f"参数hs_color[0]值{hue}超出范围[0, 360]")
+        raise ValueError(f"Parameter hs_color[0] value {hue} is out of range [0, 360]")
     if not 0 <= saturation <= 100:
-        raise ValueError(f"参数hs_color[1]值{saturation}超出范围[0, 100]")
+        raise ValueError(f"Parameter hs_color[1] value {saturation} is out of range [0, 100]")
 
     return hue, saturation
 
 
 def _tuya_hsv_value_to_ha_brightness(value: int) -> int:
-    """将Tuya HSV明度(v)转换为HA亮度(0-255)。"""
+    """Convert Tuya HSV value (v, 0-1000) to HA brightness (0-255)."""
     validate_value(value, 0, 1000, "colour_data.v")
     return round(value * 255 / 1000)
 
 
 def _ha_brightness_to_tuya_hsv_value(brightness: int) -> int:
-    """将HA亮度(0-255)转换为Tuya HSV明度(0-1000)。"""
+    """Convert HA brightness (0-255) to Tuya HSV value (v, 0-1000)."""
     validate_value(brightness, 0, 255, "brightness")
     return round(brightness * 1000 / 255)
 
@@ -65,7 +65,7 @@ def _ha_brightness_to_tuya_hsv_value(brightness: int) -> int:
 def _tuya_hsv_to_ha_hs_brightness(
     colour_data: dict[str, int],
 ) -> tuple[list[float], int]:
-    """将Tuya HSV转换为HA hs_color和brightness。"""
+    """Convert Tuya HSV to HA hs_color and brightness."""
     return (
         [float(colour_data["h"]), round(colour_data["s"] / 10, 1)],
         _tuya_hsv_value_to_ha_brightness(colour_data["v"]),
@@ -76,7 +76,7 @@ def _ha_hs_brightness_to_tuya_hsv(
     hs_color: Any,
     brightness: int | None,
 ) -> dict[str, int]:
-    """将HA hs_color和brightness转换为Tuya HSV。"""
+    """Convert HA hs_color and brightness to Tuya HSV."""
     hue, saturation = _validate_ha_hs_color(hs_color)
     value = 1000 if brightness is None else _ha_brightness_to_tuya_hsv_value(brightness)
     return {
@@ -87,13 +87,13 @@ def _ha_hs_brightness_to_tuya_hsv(
 
 
 # ------------------------------
-# 核心函数1：涂鸦指令 → HA Light指令
-# 只处理 switch_led + colour_data(HSV)
+# Core function 1: Tuya command → HA Light command
+# Only handles switch_led + colour_data (HSV)
 # ------------------------------
-def tuya_to_ha(tuya_dps: Dict[str, Any], ha_entity_id: str) -> Dict[str, Any]:
-    """将涂鸦DPS指令转换为HA Light服务调用参数。
+def tuya_to_ha(tuya_dps: Dict[str, Any], ha_entity_id: str, context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Convert Tuya DPS commands to HA Light service call parameters.
 
-    仅处理 switch_led（开关）和 colour_data（HSV彩光）。
+    Only handles switch_led (on/off) and colour_data (HSV color).
     """
     ha_params: Dict[str, Any] = {
         "domain": "light",
@@ -101,7 +101,7 @@ def tuya_to_ha(tuya_dps: Dict[str, Any], ha_entity_id: str) -> Dict[str, Any]:
         "service_data": {"entity_id": ha_entity_id},
     }
 
-    # 1. 开关指令：没有switch_led但有colour_data时，视为开灯
+    # 1. Switch command: if switch_led is absent but colour_data is present, treat as turn-on
     if "switch_led" not in tuya_dps and "colour_data" in tuya_dps:
         switch_led = True
     else:
@@ -113,7 +113,7 @@ def tuya_to_ha(tuya_dps: Dict[str, Any], ha_entity_id: str) -> Dict[str, Any]:
 
     ha_params["service"] = "turn_on"
 
-    # 2. 彩光 colour_data（Tuya HSV → HA hs_color + brightness）
+    # 2. Color data colour_data (Tuya HSV → HA hs_color + brightness)
     if "colour_data" in tuya_dps:
         raw_colour = tuya_dps["colour_data"]
         if isinstance(raw_colour, str):
@@ -127,29 +127,29 @@ def tuya_to_ha(tuya_dps: Dict[str, Any], ha_entity_id: str) -> Dict[str, Any]:
 
 
 # ------------------------------
-# 核心函数2：HA Light状态 → 涂鸦DPS指令
-# 只上报 switch_led + colour_data(HSV)
-# 灯关闭时 colour_data 给默认值
+# Core function 2: HA Light state → Tuya DPS command
+# Only reports switch_led + colour_data (HSV)
+# When the light is off, colour_data uses default values
 # ------------------------------
-def ha_to_tuya(ha_state: Dict[str, Any], ha_attributes: Dict[str, Any]) -> Dict[str, Any]:
-    """从HA灯光状态/属性转换为涂鸦DPS指令。
+def ha_to_tuya(ha_state: Dict[str, Any], ha_attributes: Dict[str, Any], context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Convert HA light state/attributes to Tuya DPS commands.
 
-    仅上报 switch_led 和 colour_data（HSV）。
-    灯关闭时 colour_data 上报默认值。
+    Only reports switch_led and colour_data (HSV).
+    When the light is off, colour_data reports default values.
     """
     tuya_dps: Dict[str, Any] = {}
 
-    # 1. 开关
+    # 1. On/off switch
     is_on = ha_state.get("state") == "on"
     tuya_dps["switch_led"] = is_on
 
-    # 2. 彩光 colour_data
+    # 2. Color data colour_data
     if not is_on:
-        # 灯关闭时上报默认HSV
+        # Report default HSV when the light is off
         tuya_dps["colour_data"] = json.dumps(DEFAULT_HSV, separators=(",", ":"))
         return tuya_dps
 
-    # 灯开启时，从HA属性构建HSV
+    # When the light is on, build HSV from HA attributes
     if "hs_color" in ha_attributes:
         brightness = ha_attributes.get("brightness")
         if brightness is not None:
@@ -160,7 +160,7 @@ def ha_to_tuya(ha_state: Dict[str, Any], ha_attributes: Dict[str, Any]) -> Dict[
         )
         tuya_dps["colour_data"] = json.dumps(hsv_dict, separators=(",", ":"))
     elif "brightness" in ha_attributes:
-        # 只有亮度没有颜色时，用h=0,s=0表示白光，v取亮度
+        # When only brightness is available without color, use h=0, s=0 for white light, v for brightness
         brightness = ha_attributes["brightness"]
         validate_value(brightness, 0, 255, "brightness")
         hsv_dict = {
@@ -174,34 +174,34 @@ def ha_to_tuya(ha_state: Dict[str, Any], ha_attributes: Dict[str, Any]) -> Dict[
 
 
 # ------------------------------
-# 调用示例
+# Usage examples
 # ------------------------------
 if __name__ == "__main__":
-    # 示例 1：涂鸦开灯+彩光 → HA
+    # Example 1: Tuya turn-on + color → HA
     tuya_dps_example = {
         "switch_led": True,
         "colour_data": {"h": 120, "s": 1000, "v": 500},
     }
     ha_params = tuya_to_ha(tuya_dps_example, "light.tuya_living_room")
-    print("=== 示例 1: 涂鸦→HA（开灯+绿色）===")
+    print("=== Example 1: Tuya → HA (turn on + green) ===")
     print(json.dumps(ha_params, indent=2, ensure_ascii=False))
 
-    # 示例 2：涂鸦关灯 → HA
+    # Example 2: Tuya turn-off → HA
     tuya_off_example = {"switch_led": False}
     ha_params = tuya_to_ha(tuya_off_example, "light.tuya_bedroom")
-    print("\n=== 示例 2: 涂鸦→HA（关灯）===")
+    print("\n=== Example 2: Tuya → HA (turn off) ===")
     print(json.dumps(ha_params, indent=2, ensure_ascii=False))
 
-    # 示例 3：HA开灯+彩色 → 涂鸦
+    # Example 3: HA turn-on + color → Tuya
     ha_state_on = {"state": "on"}
     ha_attrs_colour = {"brightness": 150, "hs_color": [120, 100]}
     tuya_dps = ha_to_tuya(ha_state_on, ha_attrs_colour)
-    print("\n=== 示例 3: HA→涂鸦（开灯+绿色）===")
+    print("\n=== Example 3: HA → Tuya (turn on + green) ===")
     print(json.dumps(tuya_dps, indent=2, ensure_ascii=False))
 
-    # 示例 4：HA关灯 → 涂鸦（colour_data给默认值）
+    # Example 4: HA turn-off → Tuya (colour_data uses default values)
     ha_state_off = {"state": "off"}
     ha_attrs_off = {}
     tuya_dps = ha_to_tuya(ha_state_off, ha_attrs_off)
-    print("\n=== 示例 4: HA→涂鸦（关灯，HSV默认值）===")
+    print("\n=== Example 4: HA → Tuya (turn off, HSV defaults) ===")
     print(json.dumps(tuya_dps, indent=2, ensure_ascii=False))

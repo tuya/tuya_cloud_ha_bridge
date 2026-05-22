@@ -1,6 +1,5 @@
 {
   "name": "tuya_cloud_ha_bridge",
   "render_readme": true,
-  "homeassistant": "2026.3.0",
-  "country": ["CN"]
+  "homeassistant": "2026.3.0"
 }

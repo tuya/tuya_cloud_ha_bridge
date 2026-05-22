@@ -39,6 +39,7 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_VALID_COVER_CONTROL_VALUES = frozenset({"open_cover", "stop_cover", "close_cover"})
 
 
 def _reason_code_details(reason_code: Any) -> tuple[int, str, bool]:
@@ -134,7 +135,9 @@ class TuyaLinkMqttClient:
         self._connect_reason_code = 0
         self._connect_error_message: str | None = None
         self._pending_subdevice_delete_requests: dict[str, list[str]] = {}
+        self._pending_bind_requests: dict[str, dict[str, Any]] = {}
         self._subscribed_child_ids: set[str] = set()
+        self._last_child_cover_commands: dict[str, str] = {}
 
     @property
     def connected(self) -> bool:
@@ -298,26 +301,64 @@ class TuyaLinkMqttClient:
         if self._on_message:
             self._on_message(message.topic, message.payload)
 
-    def publish_subdevice_bind(self, children: list[dict[str, Any]]) -> None:
-        """Publish a child-device bind request.
+    def publish_subdevice_bind(self, children: list[dict[str, Any]]) -> str:
+        """Publish a child-device bind request. Returns the msgId used.
 
         Each child dict may contain: productId, clientId, deviceName,
-        defaultProperties (list of {code, value}).
+        defaultProperties (list of {code, value, name?, dpProperties?}).
+        The payload is stored internally so it can be re-sent once on
+        a code=1001 response (see republish_subdevice_bind).
         """
         if not self._client or not self._connected:
             _LOGGER.warning("Cannot publish child bind: not connected")
-            return
+            return ""
         topic = TUYA_LINK_TOPIC_SUBDEVICE_BIND.format(device_id=self._device_id)
+        msg_id = str(int(time.time() * 1000))
         payload = json.dumps(
             {
-                "msgId": str(int(time.time() * 1000)),
+                "msgId": msg_id,
                 "time": int(time.time() * 1000),
                 "version": "1.0",
                 "data": children,
             }
         )
+        self._pending_bind_requests[msg_id] = {"children": children, "retried": False}
         _LOGGER.debug("Publishing subdevice bind topic=%s payload=%s", topic, payload)
         self._client.publish(topic, payload, qos=1)
+        return msg_id
+
+    def republish_subdevice_bind(self, msg_id: str) -> bool:
+        """Re-send a previous bind request with the same msgId (one retry only).
+
+        Returns True if the retry was published, False if already retried,
+        not found, or not connected.
+        """
+        pending = self._pending_bind_requests.get(msg_id)
+        if pending is None or pending["retried"]:
+            return False
+        if not self._client or not self._connected:
+            _LOGGER.warning("Cannot retry child bind (msgId=%s): not connected", msg_id)
+            return False
+        pending["retried"] = True
+        topic = TUYA_LINK_TOPIC_SUBDEVICE_BIND.format(device_id=self._device_id)
+        payload = json.dumps(
+            {
+                "msgId": msg_id,
+                "time": int(time.time() * 1000),
+                "version": "1.0",
+                "data": pending["children"],
+            }
+        )
+        _LOGGER.debug(
+            "Retrying subdevice bind (msgId=%s) topic=%s payload=%s",
+            msg_id, topic, payload,
+        )
+        self._client.publish(topic, payload, qos=1)
+        return True
+
+    def pop_pending_bind_request(self, msg_id: str) -> None:
+        """Clear a tracked bind request once fully processed."""
+        self._pending_bind_requests.pop(msg_id, None)
 
     def publish_ha_devices(
         self, devices: list[dict[str, str]]
@@ -509,6 +550,22 @@ class TuyaLinkMqttClient:
         )
         self._client.publish(topic, payload, qos=1)
 
+    def remember_child_cover_command(self, child_device_id: str, control: Any) -> None:
+        """Remember the latest cover control command for a child device."""
+        if (
+            isinstance(child_device_id, str)
+            and child_device_id
+            and isinstance(control, str)
+            and control in _VALID_COVER_CONTROL_VALUES
+        ):
+            self._last_child_cover_commands[child_device_id] = control
+
+    def get_last_child_cover_command(self, child_device_id: str) -> str:
+        """Return the latest remembered cover control command."""
+        if not isinstance(child_device_id, str) or not child_device_id:
+            return "stop_cover"
+        return self._last_child_cover_commands.get(child_device_id, "stop_cover")
+
     def _subscribe_child_topics(self, child_device_id: str) -> None:
         """Subscribe to MQTT topics for a single child device."""
         property_topic = TUYA_LINK_TOPIC_PROPERTY_SET.format(device_id=child_device_id)
@@ -533,6 +590,7 @@ class TuyaLinkMqttClient:
     def unsubscribe_child_device_messages(self, child_device_id: str) -> None:
         """Unsubscribe from child-device control and response topics."""
         self._subscribed_child_ids.discard(child_device_id)
+        self._last_child_cover_commands.pop(child_device_id, None)
         if not self._client:
             return
         property_topic = TUYA_LINK_TOPIC_PROPERTY_SET.format(device_id=child_device_id)
@@ -556,5 +614,7 @@ class TuyaLinkMqttClient:
         self._connected = False
         self._connect_event.clear()
         self._pending_subdevice_delete_requests.clear()
+        self._pending_bind_requests.clear()
         self._subscribed_child_ids.clear()
+        self._last_child_cover_commands.clear()
         _LOGGER.debug("Tuya Link MQTT disconnected")

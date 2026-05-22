@@ -23,7 +23,7 @@ async def async_execute_service_calls(
         domain = service_call.get("domain")
         service = service_call.get("service")
         service_data = service_call.get("service_data", {})
-        if not isinstance(domain, str) or not isinstance(service, str):
+        if not isinstance(domain, str) or not isinstance(service, str) or not service:
             continue
         if domain not in ALLOWED_SERVICE_DOMAINS:
             LOGGER.warning("Blocked service call to disallowed domain: %s.%s", domain, service)

@@ -35,6 +35,7 @@ class HaCategoryPidMapping:
 
     code: str
     product_id: str
+    category_code: str = ""
 
 
 class TuyaOpenApiError(Exception):
@@ -48,12 +49,15 @@ class TuyaOpenApiError(Exception):
 
 
 async def async_create_ha_gateway(
-    hass: HomeAssistant, api_key: str
+    hass: HomeAssistant, api_key: str, client_id: str | None = None
 ) -> HaGatewayResult:
     """Call Tuya OpenAPI to create an HA gateway device.
 
     POST https://{api_gateway_host}/v1.0/end-user/devices/ha/gateway/active
     Authorization: Bearer {api_key}
+
+    When *client_id* is provided it is sent as ``clientId`` in the request
+    body so the cloud can perform idempotent gateway creation.
 
     Returns HaGatewayResult with productId, deviceId, deviceName,
     deviceSecret and shortUrl from the cloud response.
@@ -61,11 +65,16 @@ async def async_create_ha_gateway(
     endpoints = get_region_endpoints_for_api_key(api_key)
     url = f"https://{endpoints.api_gateway_host}{TUYA_OPENAPI_GATEWAY_ACTIVE_PATH}"
 
-    LOGGER.debug("POST %s", url)
+    request_body: dict[str, str] = {}
+    if client_id:
+        request_body["clientId"] = client_id
+
+    LOGGER.debug("POST %s body=%s", url, request_body)
     session = async_get_clientsession(hass)
     resp = await session.post(
         url,
         headers={"Authorization": f"Bearer {api_key}"},
+        json=request_body if request_body else None,
         timeout=10,
     )
     resp.raise_for_status()
@@ -219,7 +228,10 @@ async def async_get_category_pid_mappings(
             continue
         code = item.get("code")
         product_id = item.get("productId")
+        category_code = item.get("categoryCode", "") or ""
         if isinstance(code, str) and code and isinstance(product_id, str) and product_id:
-            mappings.append(HaCategoryPidMapping(code=code, product_id=product_id))
+            mappings.append(HaCategoryPidMapping(
+                code=code, product_id=product_id, category_code=str(category_code),
+            ))
 
     return mappings
