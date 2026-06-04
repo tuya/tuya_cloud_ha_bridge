@@ -1,6 +1,8 @@
 # tuya_cloud_ha_bridge
 
-`tuya_cloud_ha_bridge` 是一个 Home Assistant 自定义集成，用于将 Home Assistant 中的设备同步到涂鸦 App。集成会在涂鸦云侧创建一个虚拟网关，并通过 Tuya Link MQTT 实现云端双向状态同步，这样就可以在涂鸦 App 中完成设备控制、自动化和语音联动。
+`tuya_cloud_ha_bridge` 是一个 Home Assistant 自定义集成，让你在涂鸦 App 中直接控制 Home Assistant 里的设备，并使用 App 的自动化和语音联动能力。
+
+它的工作方式是：在涂鸦云侧创建一个「虚拟网关」，把 Home Assistant 的设备作为子设备挂在网关下，再通过 Tuya Link MQTT 实现两端实时双向状态同步。
 
 English documentation: [`README.md`](README.md)
 
@@ -27,48 +29,7 @@ English documentation: [`README.md`](README.md)
 
 ### 方式一：通过 HACS 安装
 
-#### 场景 A：Home Assistant 尚未集成 HACS
-
-HACS 并不是 Home Assistant 默认自带的组件，它是由社区维护的第三方扩展商店。如果你的 Home Assistant 里还没有 HACS，可以按下面步骤先完成 HACS 安装和初始化。
-
-##### 1. 确认前置条件
-
-- Home Assistant 已经安装并可正常运行
-- 你拥有一个可用的 GitHub 账号，后续需要用于授权验证
-- 你能够访问 Home Assistant 的文件系统，例如已经安装 `Advanced SSH & Web Terminal` 或 `File Editor`
-
-##### 2. 通过脚本安装 HACS
-
-1. 进入 Home Assistant 终端
-2. 执行以下命令安装 HACS：
-
-```bash
-wget -O - https://get.hacs.xyz | bash -
-```
-
-3. 等待脚本执行完成
-4. 脚本执行完成后，重启 Home Assistant
-
-##### 3. 在界面中集成 HACS
-
-重启完成后，HACS 还不会直接出现在左侧菜单栏，需要手动在 Home Assistant 界面中完成集成：
-
-1. 点击左下角 `设置`
-2. 进入 `设备与服务`
-3. 点击右下角 `添加集成`
-4. 搜索 `HACS` 并点击进入
-5. 勾选所有声明选项
-6. 页面会显示一个 8 位验证码
-7. 点击页面中的 GitHub 授权链接
-8. 跳转到 GitHub 后，输入验证码并完成授权
-
-##### 4. 确认 HACS 已启用
-
-完成授权后，HACS 会出现在 Home Assistant 左侧菜单栏中。确认 HACS 可以正常打开后，再继续执行下方“场景 B”的插件安装步骤。
-
-如果你需要 HACS 安装的更详细图文教程，建议自行在网上搜索对应版本的 Home Assistant / HACS 安装指南。
-
-#### 场景 B：Home Assistant 已经集成 HACS
+> 前置条件：需要先装好 HACS。HACS 是社区维护的第三方扩展商店，并非 Home Assistant 自带，安装方式请参考 [HACS 官方文档](https://hacs.xyz/)。装好后再按下面步骤添加本集成。
 
 1. 打开 Home Assistant 的 `HACS`
 2. 进入自定义仓库管理页面，添加自定义仓库
@@ -103,6 +64,12 @@ wget -O - https://get.hacs.xyz | bash -
 
 ## 配置步骤
 
+整个配置就是一条链，先看懂逻辑再操作就不会乱：
+
+> 在 HA 中装好集成 → 集成在涂鸦云侧建一个「虚拟网关」并生成二维码 → 用涂鸦 App 扫码，把网关绑到你的账号 → 在 App 的网关面板里挂上要同步的 Home Assistant 设备。
+
+记住一个关系就够了：**网关是壳，要同步的设备是挂在壳下面的子设备**。
+
 ### 第 1 步：添加集成
 
 1. 进入 Home Assistant
@@ -136,11 +103,9 @@ wget -O - https://get.hacs.xyz | bash -
 ![在 HA 二维码扫描](./images/ha-bridage-3.png)
 
 3. 完成 App 侧的网关添加流程
-4. 返回 Home Assistant 页面后，务必点击 `提交`
+4. 完成后**必须回到 Home Assistant 页面点击 `提交`**，集成才会正式保存这个网关。如果直接关掉页面没有点提交，网关将无法在 App 中正常使用。
 
 ![在 HA 集成结束](./images/ha-bridage-4.png)
-
-> 注意：如果扫码后直接关闭页面而没有点击 `提交`，虚拟网关可能无法在 App 中正常使用。
 
 ### 第 4 步：在 App 中添加子设备
 

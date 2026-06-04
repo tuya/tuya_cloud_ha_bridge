@@ -1,6 +1,8 @@
 # tuya_cloud_ha_bridge
 
-`tuya_cloud_ha_bridge` is a Home Assistant custom integration that syncs devices from Home Assistant to the Tuya app. The integration creates a virtual gateway in Tuya Cloud and uses Tuya Link MQTT for bidirectional cloud state synchronization, so you can control devices, build automations, and use voice integrations from the Tuya app.
+`tuya_cloud_ha_bridge` is a Home Assistant custom integration that lets you control your Home Assistant devices directly from the Tuya app, and use the app's automation and voice integration features.
+
+Under the hood, it creates a "virtual gateway" in Tuya Cloud, attaches your Home Assistant devices to it as sub-devices, and keeps both sides in sync in real time over Tuya Link MQTT.
 
 中文说明: [`README_zh.md`](README_zh.md)
 
@@ -104,6 +106,12 @@ For example:
 
 ## Configuration
 
+The whole setup is a single chain — understand the flow first and the steps won't feel disconnected:
+
+> Install the integration in HA → the integration creates a "virtual gateway" in Tuya Cloud and generates a QR code → scan the QR code with the Tuya app to bind the gateway to your account → add the Home Assistant devices you want to sync under the gateway panel in the app.
+
+Just remember one relationship: **the gateway is the shell, and the devices you sync are sub-devices attached under it.**
+
 ### Step 1: Add the integration
 
 1. Open Home Assistant
@@ -139,11 +147,9 @@ After submission, the integration will:
 ![Scan the QR code from Home Assistant](./images/ha-bridage-3-en.png)
 
 3. Complete the gateway setup flow in the app
-4. After returning to the Home Assistant page, make sure to click `Submit`
+4. After finishing in the app, you **must return to the Home Assistant page and click `Submit`** — only then does the integration formally save the gateway. If you close the page without clicking `Submit`, the gateway will not work correctly in the app.
 
 ![Finish the integration flow in Home Assistant](./images/ha-bridage-4-en.png)
-
-> Note: If you close the page directly after scanning the QR code without clicking `Submit`, the virtual gateway may not work correctly in the app.
 
 ### Step 4: Add sub-devices in the app
 
