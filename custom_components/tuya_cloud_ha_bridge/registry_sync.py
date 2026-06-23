@@ -10,15 +10,6 @@ from homeassistant.helpers import entity_registry as er
 
 from . import TuyaHaNewConfigEntry
 from .const import DOMAIN, LOGGER
-from .mapping_runtime import (
-    async_ensure_mapping_module_loaded,
-    async_ensure_pid_mapping_loaded,
-    get_category_candidates_for_domain,
-    get_product_id_for_domain,
-    infer_category_for_entity,
-    infer_domain_for_device,
-    select_preferred_domain,
-)
 from .storage import (
     GatewayBindingsData,
     async_load_gateway_bindings,
@@ -96,7 +87,6 @@ async def async_sync_gateway_devices(
     hass: HomeAssistant, entry: TuyaHaNewConfigEntry
 ) -> GatewayBindingsData:
     """Discover, filter, and persist eligible devices."""
-    await async_ensure_pid_mapping_loaded(hass)
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
     previous_bindings = await async_load_gateway_bindings(hass, entry.entry_id) or {}
@@ -132,91 +122,47 @@ async def async_sync_gateway_devices(
         if device.id not in previous_bindings.get("devices", {}):
             continue
 
+        # Read stored binding info from previous_bindings (confirmed via bind flow).
+        # registry_sync runs before route table construction, so we use persisted data.
+        prev_device_data = previous_bindings.get("devices", {}).get(device.id, {})
+        stored_domain = prev_device_data.get("domain")
+        stored_product_id = prev_device_data.get("product_id")
+        stored_category_code = prev_device_data.get("category_code", "")
+
+        if not stored_domain or not stored_product_id:
+            LOGGER.debug(
+                "registry_sync: device %s (%s) no stored binding info, skipping",
+                device.name_by_user or device.name or device.id, device.id,
+            )
+            continue
+
+        # Collect entities matching the stored domain.
         bound_entities: list[BoundEntity] = []
-        entity_domains: set[str] = set()
         for entity_entry in er.async_entries_for_device(entity_registry, device.id):
             if entity_entry.disabled_by is not None:
                 continue
             if _is_excluded_domain(_async_entry_domain(hass, entity_entry.config_entry_id)):
                 continue
-            entity_domains.add(entity_entry.domain)
-
-        # Pick the highest-priority domain, then check cloud PID mapping.
-        selected_domain = infer_domain_for_device(entity_domains)
-        if not selected_domain:
-            LOGGER.debug(
-                "Skipping non-Tuya device %s: no supported domain inferred",
-                device.name_by_user or device.name or device.id,
-            )
-            continue
-
-        if not await async_ensure_mapping_module_loaded(hass, selected_domain):
-            LOGGER.debug(
-                "Skipping device %s: no mapping module for domain %s",
-                device.name_by_user or device.name or device.id,
-                selected_domain,
-            )
-            continue
-
-        # Get all category candidates for this domain.
-        candidates = get_category_candidates_for_domain(selected_domain)
-
-        # Now collect matching entities for the inferred domain.
-        for entity_entry in er.async_entries_for_device(entity_registry, device.id):
-            if entity_entry.disabled_by is not None:
+            if entity_entry.domain != stored_domain:
                 continue
-            if _is_excluded_domain(_async_entry_domain(hass, entity_entry.config_entry_id)):
-                continue
-            if entity_entry.domain != selected_domain:
-                continue
-
-            # Infer category for this entity when multiple candidates exist.
-            inferred = infer_category_for_entity(
-                hass, entity_entry.entity_id, candidates,
-                device_name=device.name,
-                device_model=device.model,
-                device_manufacturer=device.manufacturer,
-            ) if candidates else None
-            entity_category_code = inferred.category_code if inferred else ""
 
             bound_entities.append(
                 BoundEntity(
                     entity_id=entity_entry.entity_id,
                     device_id=device.id,
                     domain=entity_entry.domain,
-                    category_code=entity_category_code,
+                    category_code=stored_category_code,
                 )
             )
 
         if not bound_entities:
             continue
 
-        if len(entity_domains) > 1:
-            LOGGER.debug(
-                "Device %s has multiple domains %s; inferred %s",
-                device.id,
-                sorted(entity_domains),
-                selected_domain,
-            )
-
+        selected_domain = stored_domain
+        product_id = stored_product_id
+        entity_category_code = stored_category_code
         selected_entities = bound_entities
         primary_entity = selected_entities[0]
-
-        # Determine product_id and category_code from the primary entity's inference.
-        entity_category_code = primary_entity.category_code
-        if candidates and entity_category_code:
-            # Use the PID from the matched category candidate.
-            product_id: str | None = None
-            for c in candidates:
-                if c.category_code == entity_category_code:
-                    product_id = c.product_id
-                    break
-            if product_id is None:
-                product_id = get_product_id_for_domain(selected_domain)
-        else:
-            product_id = get_product_id_for_domain(selected_domain)
-        if product_id is None:
-            continue
 
         devices[device.id] = {
             "name": device.name_by_user or device.name or device.id,

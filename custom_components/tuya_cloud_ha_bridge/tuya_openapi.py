@@ -10,7 +10,6 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     LOGGER,
-    TUYA_OPENAPI_CATEGORY_PID_MAPPINGS_PATH,
     TUYA_OPENAPI_GATEWAY_ACTIVE_PATH,
     TUYA_OPENAPI_GATEWAY_DELETE_PATH,
     TUYA_OPENAPI_SUB_DEVICE_LIMIT_PATH,
@@ -27,15 +26,6 @@ class HaGatewayResult:
     device_name: str
     device_secret: str
     short_url: str
-
-
-@dataclass(frozen=True, slots=True)
-class HaCategoryPidMapping:
-    """A single HA category to Tuya product ID mapping."""
-
-    code: str
-    product_id: str
-    category_code: str = ""
 
 
 class TuyaOpenApiError(Exception):
@@ -184,54 +174,3 @@ async def async_get_sub_device_limit(
     return limit_count
 
 
-async def async_get_category_pid_mappings(
-    hass: HomeAssistant, api_key: str
-) -> list[HaCategoryPidMapping]:
-    """Fetch HA category-PID mapping list from Tuya cloud.
-
-    GET https://{api_gateway_host}/v1.0/end-user/services/ha/category/pid/mappings
-    Authorization: Bearer {api_key}
-
-    Returns a list ordered by domain priority (first = highest).
-    """
-    endpoints = get_region_endpoints_for_api_key(api_key)
-    url = (
-        f"https://{endpoints.api_gateway_host}"
-        f"{TUYA_OPENAPI_CATEGORY_PID_MAPPINGS_PATH}"
-    )
-
-    LOGGER.debug("GET %s", url)
-    session = async_get_clientsession(hass)
-    resp = await session.get(
-        url,
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    body: dict[str, Any] = await resp.json()
-    LOGGER.debug("GET %s response: %s", url, body)
-
-    if not body.get("success"):
-        error_code = body.get("errorCode", "UNKNOWN")
-        error_msg = body.get("errorMsg", "Unknown error")
-        raise TuyaOpenApiError(str(error_code), str(error_msg))
-
-    result = body.get("result")
-    if not isinstance(result, list):
-        raise TuyaOpenApiError(
-            "INVALID_RESPONSE", "Missing result list in response"
-        )
-
-    mappings: list[HaCategoryPidMapping] = []
-    for item in result:
-        if not isinstance(item, dict):
-            continue
-        code = item.get("code")
-        product_id = item.get("productId")
-        category_code = item.get("categoryCode", "") or ""
-        if isinstance(code, str) and code and isinstance(product_id, str) and product_id:
-            mappings.append(HaCategoryPidMapping(
-                code=code, product_id=product_id, category_code=str(category_code),
-            ))
-
-    return mappings

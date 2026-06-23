@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass, field
 from datetime import timedelta
 import json
@@ -15,11 +16,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_API_KEY,
     EVENT_CORE_CONFIG_UPDATE,
+    EVENT_HOMEASSISTANT_STARTED,
     EVENT_STATE_CHANGED,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import Event, HomeAssistant, State, callback
+from homeassistant.core import CoreState, Event, HomeAssistant, State, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -36,6 +38,7 @@ from .const import (
     LOGGER,
     TOPO_GET_PAGE_SIZE,
     TOPO_SYNC_INTERVAL_SECONDS,
+    RULE_CHECK_INTERVAL_SECONDS,
     TUYA_LINK_TOPIC_DEVICE_UNBIND_NOTICE,
     TUYA_LINK_TOPIC_SUBDEVICE_DELETE,
     TUYA_LINK_TOPIC_SUBDEVICE_BIND_RESPONSE,
@@ -44,25 +47,17 @@ from .const import (
     TUYA_LINK_TOPIC_TOPO_CHANGE,
     TUYA_LINK_TOPIC_TOPO_GET_RESPONSE,
 )
-from .mapping_runtime import (
-    async_ensure_mapping_module_loaded,
-    async_ensure_pid_mapping_loaded,
-    async_load_pid_mapping_from_cloud,
-    build_service_calls_from_tuya,
-    build_tuya_properties_from_state,
-    get_category_candidates_for_domain,
-    get_product_id_for_domain,
-    get_property_metadata,
-    has_mapping_module,
-    infer_category_for_entity,
-    infer_domain_for_device,
-    select_preferred_domain,
-)
 from .region_mapping import get_region_endpoints_for_api_key
+from .pidspec_bridge import (
+    async_init_pidspec,
+    get_route_table,
+    pidspec_build_full_device_properties,
+    pidspec_build_service_calls,
+)
 from .storage import (
+    async_delete_gateway_bindings,
     async_load_gateway_bindings,
     async_load_gateway_credentials,
-    async_migrate_gateway_bindings,
     async_save_gateway_bindings,
 )
 from .services import (
@@ -75,6 +70,10 @@ type TuyaHaNewConfigEntry = ConfigEntry[TuyaLinkMqttClient | None]
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 REGISTRY_SYNC_DEBOUNCE_SECONDS = 1.0
+# Per-entry structural fingerprint of inferable devices, keyed by entry_id.
+# Used to skip registry-driven re-inference when no inference-relevant device
+# profile actually changed (cosmetic registry churn → no re-infer / re-report).
+_DEVICE_FINGERPRINTS: dict[str, dict[str, str]] = {}
 _PENDING_GATEWAY_CLIENTS = "pending_gateway_clients"
 _PENDING_BIND_CLIENTS = "pending_bind_clients"
 _TOPO_SYNC_SESSIONS = "topo_sync_sessions"
@@ -83,6 +82,17 @@ _TOPO_SYNC_SESSIONS = "topo_sync_sessions"
 # associated with the config entry (which would trigger the "created devices"
 # popup).
 _INITIAL_SYNC_DELAY_SECONDS = 5
+# Grace period after EVENT_HOMEASSISTANT_STARTED before kicking off the first
+# topo/get. HOMEASSISTANT_STARTED fires when all integrations have finished
+# async_setup_entry, but some (xiaomi_home, mqtt-discovered, …) still populate
+# their entities' live state asynchronously for a few seconds after that —
+# their entity_registry rows exist (persisted from a previous session) but
+# `hass.states.get(entity_id).state` is still `unavailable` until the
+# integration's first poll/push lands. If topo/get runs in that window, our
+# offline gate (_device_has_available_entity) wrongly classifies the device as
+# offline → restore-unbind → cloud unbinds a perfectly good high-confidence
+# device. The grace period gives those integrations time to push first state.
+_POST_STARTED_GRACE_SECONDS = 15
 _TOPO_SYNC_SESSION_TIMEOUT_SECONDS = 30
 _STATE_REPORT_DEBOUNCE_SECONDS = 0.15
 _UNSET = object()
@@ -427,33 +437,36 @@ async def _async_report_all_bound_device_states(
         if not isinstance(tuya_device_id, str) or not tuya_device_id:
             continue
 
-        primary_entity_id = device_data.get("primary_entity_id")
-        if not isinstance(primary_entity_id, str):
-            entity_ids = device_data.get("entity_ids")
-            if isinstance(entity_ids, list) and entity_ids:
-                primary_entity_id = entity_ids[0]
-            else:
-                continue
+        context = _build_mapping_context(hass, client, tuya_device_id)
 
-        entity_state = hass.states.get(primary_entity_id)
-        if not _state_can_be_reported(entity_state):
+        # Primary path: assemble the COMPLETE PID payload from all bound
+        # entities' live states (Tuya expects PID-level full-state reports).
+        properties = pidspec_build_full_device_properties(
+            hass, tuya_device_id, context=context
+        )
+
+        if properties is None:
+            # Binding is pidspec-gated: a device only enters this loop if its
+            # PidSpec resolved (route table stored at bind). None here means the
+            # route table went missing — skip rather than fall back to the
+            # retired legacy mapping layer.
+            LOGGER.warning(
+                "report: no pidspec route table for tuya_device_id=%s product_id=%s; "
+                "skipping full report (legacy mapping retired)",
+                tuya_device_id,
+                device_data.get("product_id"),
+            )
             continue
 
-        domain = device_data.get("domain")
-        if not isinstance(domain, str):
-            entity_data = entities.get(primary_entity_id)
-            if entity_data is None:
-                continue
-            domain = str(entity_data["domain"])
-
-        category_code = device_data.get("category_code") or None
-        await async_ensure_mapping_module_loaded(hass, domain, category_code)
-        context = _build_mapping_context(hass, client, tuya_device_id)
-        properties = build_tuya_properties_from_state(
-            domain, entity_state, category_code, context=context
-        )
         if not properties:
             continue
+
+        # Keep the dedup snapshot in sync so the next change-driven flush does
+        # not re-send an identical full payload.
+        route_table = get_route_table(hass, tuya_device_id)
+        if route_table is not None:
+            route_table.last_reported_snapshot = _property_values(properties)
+
         await hass.async_add_executor_job(
             client.publish_child_property_report,
             tuya_device_id,
@@ -558,6 +571,34 @@ def _device_is_available_for_bindings(
     return False
 
 
+def _device_has_available_entity(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    device_id: str,
+) -> bool:
+    """Return True if the device has at least one available (online) entity.
+
+    Mirrors the availability filter used by async_publish_eligible_ha_devices
+    (device/list/found): a device with no available, non-disabled,
+    non-excluded-domain entity is treated as offline. Used by topo/get
+    reconciliation to decide whether an offline device should keep its cloud
+    binding. Works off the entity registry + live state, so it does not depend
+    on a local binding existing.
+    """
+    from .registry_sync import _async_entry_domain, _is_excluded_domain
+
+    for entity_entry in er.async_entries_for_device(entity_registry, device_id):
+        if entity_entry.disabled_by is not None:
+            continue
+        if _is_excluded_domain(
+            _async_entry_domain(hass, entity_entry.config_entry_id)
+        ):
+            continue
+        if _state_is_available(hass.states.get(entity_entry.entity_id)):
+            return True
+    return False
+
+
 async def _async_handle_bound_entity_availability_change(
     hass: HomeAssistant,
     entry: TuyaHaNewConfigEntry,
@@ -614,7 +655,6 @@ async def _async_handle_bound_entity_availability_change(
 
 
 _pending_device_reports: dict[str, asyncio.TimerHandle] = {}
-_pending_device_old_states: dict[str, State] = {}
 
 
 async def _async_report_bound_entity_state_change(
@@ -682,10 +722,11 @@ async def _async_report_bound_entity_state_change(
     if not isinstance(device_data, dict):
         return
 
-    primary_entity_id = _device_primary_entity_id(device_data)
-    if primary_entity_id is not None and entity_id != primary_entity_id:
-        return
-
+    # NOTE: do NOT gate on primary_entity_id here. Under the pidspec scheme a
+    # single tuya_device_id maps to a DeviceRouteTable spanning multiple
+    # entities across multiple domains. Any of those entities changing must be
+    # able to trigger a report; gating to the primary entity would silently drop
+    # every secondary entity's change.
     if not (domain := _device_bound_domain(bindings, device_data)):
         return
 
@@ -694,17 +735,19 @@ async def _async_report_bound_entity_state_change(
         return
 
     category_code = _device_bound_category_code(bindings, device_data) or None
-    await async_ensure_mapping_module_loaded(hass, domain, category_code)
 
+    # Coalesce per DEVICE (tuya_device_id), NOT per entity. Tuya expects a
+    # FULL-STATE report at the PID level, so when several entities of the same
+    # device change at once we must merge them into ONE complete report. A
+    # device-level key collapses concurrent multi-entity changes into a single
+    # flush that rebuilds the full payload from live HA state — this is what
+    # prevents sibling entities from overwriting each other.
     report_key = f"{entry.entry_id}:{tuya_device_id}"
-
-    if report_key not in _pending_device_old_states:
-        _pending_device_old_states[report_key] = old_state
 
     if report_key in _pending_device_reports:
         LOGGER.debug(
             "Coalesce: timer already pending for tuya_device_id=%s, "
-            "latest state will be picked up on flush",
+            "all entity changes will be merged on flush",
             tuya_device_id,
         )
         return
@@ -735,9 +778,15 @@ async def _async_flush_device_report(
     domain: str,
     category_code: str | None,
 ) -> None:
-    """Publish the debounced property report using the latest entity state."""
+    """Publish the debounced FULL-STATE property report for a device.
+
+    Tuya expects PID-level full-state reports, so we rebuild the complete DP
+    payload from the *current* state of every bound entity (not just the one
+    that triggered this flush). Building from live HA state means concurrent
+    changes on sibling entities can never overwrite each other — every flush
+    reflects the latest state of the whole device.
+    """
     _pending_device_reports.pop(report_key, None)
-    first_old_state = _pending_device_old_states.pop(report_key, None)
 
     runtime_data = getattr(entry, "runtime_data", None)
     if runtime_data is None or not hasattr(
@@ -745,48 +794,40 @@ async def _async_flush_device_report(
     ):
         return
 
-    current_state = hass.states.get(entity_id)
-    if current_state is None or not _state_can_be_reported(current_state):
-        return
-
-    LOGGER.debug(
-        "Debounce flush entity_id=%s tuya_device_id=%s state=%s",
-        entity_id,
-        tuya_device_id,
-        current_state.state,
-    )
-
     context = _build_mapping_context(hass, runtime_data, tuya_device_id)
-    new_properties = build_tuya_properties_from_state(
-        domain, current_state, category_code, context=context
+
+    # Primary path: assemble the COMPLETE PID payload from all bound entities.
+    new_properties = pidspec_build_full_device_properties(
+        hass, tuya_device_id, context=context
     )
+    if new_properties is None:
+        # Binding is pidspec-gated; a missing route table means the device is
+        # not (or no longer) pidspec-bound. Skip rather than use legacy mapping.
+        LOGGER.warning(
+            "flush report: no pidspec route table for tuya_device_id=%s; "
+            "skipping (legacy mapping retired)",
+            tuya_device_id,
+        )
+        return
     if not new_properties:
         return
 
-    old_properties = (
-        build_tuya_properties_from_state(
-            domain, first_old_state, category_code, context=context
-        )
-        if first_old_state is not None and _state_can_be_reported(first_old_state)
-        else {}
-    )
-    old_values = _property_values(old_properties)
     new_values = _property_values(new_properties)
-    if old_values == new_values:
+
+    # Dedup against the last full snapshot reported for this device. The snapshot
+    # is stored whole (never patched), so there is no read-modify-write race.
+    route_table = get_route_table(hass, tuya_device_id)
+    if route_table is not None and route_table.last_reported_snapshot == new_values:
         LOGGER.debug(
-            "Skipping bound entity report entity_id=%s "
-            "tuya_device_id=%s because mapped properties did not change",
-            entity_id,
+            "Skipping report tuya_device_id=%s: full PID snapshot unchanged",
             tuya_device_id,
         )
         return
 
     LOGGER.debug(
-        "Reporting bound entity state change entity_id=%s "
-        "tuya_device_id=%s old_values=%s new_values=%s",
-        entity_id,
+        "Reporting full PID state tuya_device_id=%s (triggered by %s) values=%s",
         tuya_device_id,
-        old_values,
+        entity_id,
         new_values,
     )
     await hass.async_add_executor_job(
@@ -794,6 +835,8 @@ async def _async_flush_device_report(
         tuya_device_id,
         new_properties,
     )
+    if route_table is not None:
+        route_table.last_reported_snapshot = new_values
 
 
 async def async_handle_property_report_response(
@@ -847,7 +890,6 @@ async def async_handle_subdevice_bind_response(
     in async_handle_subdevice_to_bind before knowing whether the cloud
     accepted the bind request.
     """
-    from .mapping_runtime import get_supported_domains_in_order
 
     try:
         message = json.loads(payload)
@@ -900,7 +942,6 @@ async def async_handle_subdevice_bind_response(
         return
 
     runtime_data = getattr(entry, "runtime_data", None)
-    await async_ensure_pid_mapping_loaded(hass)
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
 
@@ -957,59 +998,35 @@ async def async_handle_subdevice_bind_response(
 
         device_name = device.name_by_user or device.name or device.id
 
-        # Determine the domain and category_code from product_id or existing binding
-        selected_domain: str | None = None
-        selected_category_code: str = ""
-        if isinstance(product_id, str) and product_id:
-            for domain in get_supported_domains_in_order():
-                for candidate in get_category_candidates_for_domain(domain):
-                    if candidate.product_id == product_id:
-                        selected_domain = domain
-                        selected_category_code = candidate.category_code
-                        break
-                if selected_domain:
-                    break
+        # --- PidSpec-driven bind resolution (target flow) ---
+        from .pidspec_bridge import pidspec_resolve_bind, store_route_table
 
-        # Fall back to existing binding info if product_id not in response
-        if selected_domain is None and client_id in devices_map:
-            existing_domain = devices_map[client_id].get("domain")
-            if isinstance(existing_domain, str) and existing_domain:
-                selected_domain = existing_domain
-                existing_cat = devices_map[client_id].get("category_code", "")
-                selected_category_code = existing_cat if isinstance(existing_cat, str) else ""
-
-        if not selected_domain:
-            LOGGER.debug(
-                "bind_response: no domain resolved for clientId=%s productId=%s",
-                client_id,
-                product_id,
-            )
-            continue
-
-        # Resolve product_id if not provided in response
-        if not isinstance(product_id, str) or not product_id:
-            product_id = get_product_id_for_domain(selected_domain)
-
-        # Gather matching entities
         selected_entities: list[str] = []
         primary_entity_id: str | None = None
+        selected_domain: str | None = None
+        selected_category_code: str = ""
 
-        for entity_entry in er.async_entries_for_device(
-            entity_registry, device.id
-        ):
-            if entity_entry.disabled_by is not None:
-                continue
-            if entity_entry.domain != selected_domain:
-                continue
-            selected_entities.append(entity_entry.entity_id)
-            if primary_entity_id is None:
-                primary_entity_id = entity_entry.entity_id
+        if isinstance(product_id, str) and product_id:
+            bind_result = pidspec_resolve_bind(
+                hass, client_id, product_id, tuya_device_id
+            )
+            if bind_result is not None:
+                selected_entities = bind_result.entity_ids
+                primary_entity_id = bind_result.primary_entity_id
+                selected_domain = bind_result.primary_domain
+                selected_category_code = bind_result.category_code
+                store_route_table(hass, tuya_device_id, bind_result.route_table)
+                LOGGER.info(
+                    "bind_response: pidspec resolved device %s → %d entities",
+                    client_id,
+                    len(selected_entities),
+                )
 
-        if not selected_entities or primary_entity_id is None:
-            LOGGER.debug(
-                "bind_response: no matching entities for clientId=%s domain=%s",
+        if not selected_entities:
+            LOGGER.info(
+                "bind_response: pidspec cannot resolve clientId=%s productId=%s, skipping bind",
                 client_id,
-                selected_domain,
+                product_id,
             )
             continue
 
@@ -1543,7 +1560,6 @@ async def async_handle_topo_get_response(
        refreshed locally from the cloud mapping (e.g. after plugin
        uninstall and re-integration).
     """
-    from .mapping_runtime import get_supported_domains_in_order
 
     try:
         message = json.loads(payload)
@@ -1681,6 +1697,15 @@ async def async_handle_topo_get_response(
     refreshed_count = 0
     cleared_deleted_count = 0
     new_tuya_device_ids: list[str] = []
+    # Cloud-bound devices that exist in HA but fail the restore gate (excluded /
+    # offline / low-confidence / DP routing failed). For these we both request a
+    # cloud unbind (publish_subdevice_delete) AND remove our entry's association
+    # from the HA device_registry — otherwise the device still appears as
+    # belonging to tuya_cloud_ha_bridge in HA's UI even though we no longer have
+    # a binding for it. The in-memory bindings map has nothing to clean in this
+    # path (restore branch only runs for devices NOT in our in-memory map).
+    restore_unbind_tuya_ids: list[str] = []
+    restore_unbind_ha_device_ids: list[str] = []
 
     for item in response_data:
         if not isinstance(item, dict):
@@ -1759,51 +1784,102 @@ async def async_handle_topo_get_response(
             )
             continue
 
+        # Apply the SAME filters as the device/list/found discovery path
+        # (async_publish_eligible_ha_devices) so cloud bindings mirror exactly
+        # the currently-bindable set. Request a cloud unbind when the device:
+        #   - is structurally excluded (virtual/service, owned by `tuya` or
+        #     another gateway entry), or
+        #   - has NO available entity (offline). list/found does not report
+        #     offline devices at binding/restart, so a stale cloud binding for
+        #     an offline device must be unbound to stay consistent.
+        # NOTE on offline: this restore branch only runs for devices NOT
+        # already bound locally — which at startup/restart (in-memory bindings
+        # are empty) is *every* cloud device. A device that goes offline while
+        # already bound during normal runtime takes the refresh branch + Pass 4
+        # instead, where offline devices are KEPT and merely reported offline,
+        # not unbound.
+        from .registry_sync import _is_excluded_device
+
+        if _is_excluded_device(hass, device, entry.entry_id):
+            LOGGER.info(
+                "topo/get restore: clientId=%s is an excluded device → "
+                "requesting cloud unbind for tuya_device_id=%s",
+                client_id,
+                tuya_device_id,
+            )
+            restore_unbind_tuya_ids.append(tuya_device_id)
+            restore_unbind_ha_device_ids.append(client_id)
+            continue
+
+        if not _device_has_available_entity(hass, entity_registry, client_id):
+            LOGGER.info(
+                "topo/get restore: clientId=%s is offline (no available entity) "
+                "→ requesting cloud unbind for tuya_device_id=%s",
+                client_id,
+                tuya_device_id,
+            )
+            restore_unbind_tuya_ids.append(tuya_device_id)
+            restore_unbind_ha_device_ids.append(client_id)
+            continue
+
         device_name = device.name_by_user or device.name or device.id
 
-        # Determine the domain and category_code from product_id.
-        selected_domain: str | None = None
-        selected_category_code: str = ""
-        if isinstance(product_id, str) and product_id:
-            for domain in get_supported_domains_in_order():
-                for candidate in get_category_candidates_for_domain(domain):
-                    if candidate.product_id == product_id:
-                        selected_domain = domain
-                        selected_category_code = candidate.category_code
-                        break
-                if selected_domain:
-                    break
+        # --- PidSpec-driven restore resolution ---
+        # Restore MUST apply the same high-confidence inference gate as the
+        # device/list/found discovery path (async_publish_eligible_ha_devices).
+        # Trusting the stale cloud product_id via pidspec_resolve_bind alone
+        # would auto-bind devices that full inference rejects as low-confidence
+        # (score_low / margin_tight / …) — devices that never appear in
+        # list/found. For those we request a cloud unbind so the stale binding
+        # is removed; the device returns to the unbound pool and is re-reported
+        # low-confidence by async_publish_eligible_ha_devices for rule repair,
+        # then re-bound once a high-confidence rule arrives.
+        from .pidspec_bridge import (
+            _infer_pidspec_with_diagnosis,
+            pidspec_resolve_bind,
+            store_route_table,
+        )
 
-        if not selected_domain:
-            LOGGER.debug(
-                "topo/get restore: no domain for productId=%s clientId=%s",
-                product_id,
+        discovery_result, diagnosis, _infer_result = _infer_pidspec_with_diagnosis(
+            hass, client_id
+        )
+        if discovery_result is None:
+            LOGGER.info(
+                "topo/get restore: clientId=%s not high-confidence (%s) → "
+                "requesting cloud unbind for tuya_device_id=%s",
                 client_id,
+                diagnosis,
+                tuya_device_id,
             )
+            restore_unbind_tuya_ids.append(tuya_device_id)
+            restore_unbind_ha_device_ids.append(client_id)
             continue
 
-        # Gather matching entities.
-        selected_entities: list[str] = []
-        primary_entity_id: str | None = None
-
-        for entity_entry in er.async_entries_for_device(
-            entity_registry, device.id
-        ):
-            if entity_entry.disabled_by is not None:
-                continue
-            if entity_entry.domain != selected_domain:
-                continue
-            selected_entities.append(entity_entry.entity_id)
-            if primary_entity_id is None:
-                primary_entity_id = entity_entry.entity_id
-
-        if not selected_entities or primary_entity_id is None:
-            LOGGER.debug(
-                "topo/get restore: no entities for clientId=%s domain=%s",
+        # High-confidence — resolve the route table using the inference's
+        # authoritative product_id rather than the (possibly stale) cloud one.
+        bind_result = pidspec_resolve_bind(
+            hass, client_id, discovery_result.product_id, tuya_device_id
+        )
+        if bind_result is None:
+            LOGGER.info(
+                "topo/get restore: clientId=%s matched %s but DP routing failed → "
+                "requesting cloud unbind for tuya_device_id=%s",
                 client_id,
-                selected_domain,
+                discovery_result.product_id,
+                tuya_device_id,
             )
+            restore_unbind_tuya_ids.append(tuya_device_id)
+            restore_unbind_ha_device_ids.append(client_id)
             continue
+
+        selected_entities = bind_result.entity_ids
+        primary_entity_id = bind_result.primary_entity_id
+        selected_domain = bind_result.primary_domain
+        selected_category_code = bind_result.category_code
+        store_route_table(hass, tuya_device_id, bind_result.route_table)
+        # Persist the inferred product_id so the local binding stays consistent
+        # with what inference matched.
+        product_id = discovery_result.product_id
 
         # Persist binding data.
         if device.id in deleted_device_id_set:
@@ -1872,9 +1948,36 @@ async def async_handle_topo_get_response(
                 cleared_deleted_count,
             )
 
+    # Cloud bindings that failed the restore gate (excluded / offline /
+    # low-confidence / DP routing failed): unbind them from the cloud and
+    # remove this entry's association from the HA device_registry so the
+    # device no longer appears as belonging to tuya_cloud_ha_bridge in HA's
+    # UI. The in-memory bindings map has nothing to clean here — restore runs
+    # only for devices NOT in the in-memory map (the device_registry
+    # association is persistent on disk and survives our memory-only model,
+    # which is why this explicit cleanup is needed).
+    if restore_unbind_tuya_ids and runtime_data is not None and hasattr(
+        runtime_data, "publish_subdevice_delete"
+    ):
+        runtime_data.publish_subdevice_delete(restore_unbind_tuya_ids)
+        for ha_device_id in dict.fromkeys(restore_unbind_ha_device_ids):
+            stale_device = device_registry.async_get(ha_device_id)
+            if stale_device is not None and entry.entry_id in stale_device.config_entries:
+                device_registry.async_update_device(
+                    stale_device.id,
+                    remove_config_entry_id=entry.entry_id,
+                )
+        LOGGER.info(
+            "topo/get restore: requested cloud unbind for %d device(s) not "
+            "restored (excluded / offline / low-confidence): %s",
+            len(restore_unbind_tuya_ids),
+            restore_unbind_tuya_ids,
+        )
+
     if (
         not stale_local_device_ids
         and not orphaned_cloud_tuya_ids
+        and not restore_unbind_tuya_ids
         and restored_count == 0
         and refreshed_count == 0
     ):
@@ -1886,6 +1989,106 @@ async def async_handle_topo_get_response(
 
     await async_publish_eligible_ha_devices(hass, entry)
 
+    # --- Pass 4: re-validate the in-memory bindings and unbind the
+    # non-conforming ones (keeps cloud + local in sync). Catches devices that
+    # were bound earlier in this session but have since drifted.
+    #   - structurally excluded device (virtual/service, owned by `tuya` or
+    #     another gateway entry, or HA device gone) → unbind
+    #   - low-confidence / unresolved DPs (async_pidspec_check_and_unbind) → unbind
+    #
+    # OFFLINE devices are deliberately EXCLUDED from the confidence check here:
+    # inference reads live state, so an offline device's profile is degraded
+    # (missing supported_features/attributes) and would be misjudged as
+    # low-confidence. Per the runtime rule, a device that goes offline while
+    # already bound must only be reported offline (see
+    # _async_report_subdevices_online), NOT unbound. Unbinding offline devices
+    # only happens at binding/restart, which goes through the restore branch
+    # above (in-memory bindings start empty), not here.
+    from .pidspec_bridge import async_pidspec_check_and_unbind
+    from .registry_sync import _is_excluded_device
+
+    final_bindings = await async_load_gateway_bindings(hass, entry.entry_id) or {}
+    final_devices = final_bindings.get("devices", {})
+    if final_devices:
+        excluded_unbind_tuya_ids: list[str] = []
+        confidence_check_devices: dict[str, dict[str, Any]] = {}
+        for ha_device_id, device_data in final_devices.items():
+            if not isinstance(device_data, dict):
+                continue
+            tuya_device_id = device_data.get("tuya_device_id")
+            if not isinstance(tuya_device_id, str) or not tuya_device_id:
+                continue
+            device = device_registry.async_get(ha_device_id)
+            if device is None or _is_excluded_device(hass, device, entry.entry_id):
+                excluded_unbind_tuya_ids.append(tuya_device_id)
+                continue
+            # Offline bound device → keep it (reported offline elsewhere); skip
+            # the confidence check so a degraded offline profile can't unbind it.
+            if not _device_has_available_entity(hass, entity_registry, ha_device_id):
+                continue
+            confidence_check_devices[ha_device_id] = device_data
+
+        confidence_unbind_tuya_ids = await async_pidspec_check_and_unbind(
+            hass, confidence_check_devices
+        )
+        unbind_tuya_ids = list(
+            dict.fromkeys(excluded_unbind_tuya_ids + confidence_unbind_tuya_ids)
+        )
+        if unbind_tuya_ids and runtime_data is not None:
+            if hasattr(runtime_data, "publish_subdevice_delete"):
+                runtime_data.publish_subdevice_delete(unbind_tuya_ids)
+            await _async_remove_subdevice_bindings(
+                hass, entry, unbind_tuya_ids, mark_deleted_from_tuya_side=False,
+            )
+            LOGGER.info(
+                "topo/get sync pass 4: unbound %d device(s) "
+                "(%d excluded, %d low-confidence)",
+                len(unbind_tuya_ids),
+                len(excluded_unbind_tuya_ids),
+                len(confidence_unbind_tuya_ids),
+            )
+
+    # --- Pass 5: orphan device_registry sweep ---
+    # In-memory bindings are the truth source. The HA device_registry persists
+    # `entry.entry_id ∈ device.config_entries` on disk, so stale associations
+    # can outlive a binding (orphaned by a prior crash, by an older code path
+    # that forgot to clean it, or by a cloud-side unbind we observed but only
+    # cleaned in cloud + memory). Without this sweep such devices keep showing
+    # the `tuya_cloud_ha_bridge` badge in HA UI forever, even after the cloud
+    # confirmed deletion and topo/get no longer returns them. Sweep: for every
+    # HA device that carries our entry_id but has no in-memory binding (and is
+    # not mid-bind), strip the association so HA UI matches the in-memory truth.
+    final_bindings_for_sweep = (
+        await async_load_gateway_bindings(hass, entry.entry_id) or {}
+    )
+    bound_ha_ids = set(final_bindings_for_sweep.get("devices", {}).keys())
+    pending_ha_ids = set(
+        _get_pending_bind_clients(hass).get(entry.entry_id, set())
+    )
+    orphan_count = 0
+    for device in list(device_registry.devices.values()):
+        if entry.entry_id not in device.config_entries:
+            continue
+        if device.id in bound_ha_ids or device.id in pending_ha_ids:
+            continue
+        device_registry.async_update_device(
+            device.id,
+            remove_config_entry_id=entry.entry_id,
+        )
+        orphan_count += 1
+        LOGGER.info(
+            "topo/get sync pass 5: dropped orphan device_registry association "
+            "for clientId=%s (name=%s) — no in-memory binding, not pending bind",
+            device.id,
+            device.name_by_user or device.name or device.id,
+        )
+    if orphan_count:
+        LOGGER.info(
+            "topo/get sync pass 5: cleaned %d orphan device_registry "
+            "association(s) to match in-memory bindings",
+            orphan_count,
+        )
+
     # Report sub-devices online and their current states AFTER cloud
     # reconciliation so we never report devices that the cloud has deleted.
     if runtime_data is not None:
@@ -1893,11 +2096,85 @@ async def async_handle_topo_get_response(
         await _async_report_all_bound_device_states(hass, entry, runtime_data)
 
 
+def _compute_device_fingerprints(
+    hass: HomeAssistant,
+    entry: TuyaHaNewConfigEntry,
+) -> dict[str, str]:
+    """Return a structural fingerprint per inferable (unbound) device.
+
+    Captures only the inputs pidspec inference reads — device
+    name/model/manufacturer and, per entity, domain / device_class /
+    entity_category / supported_features / the SET of attribute keys — but NOT
+    volatile state values, so live readings (brightness, temperature) changing
+    does not invalidate the fingerprint. Bound and excluded devices are omitted
+    (they are not re-inferred). Used to gate registry-driven re-inference so
+    cosmetic registry churn (area/icon change, no-op rename) no longer triggers
+    re-inference and low-confidence re-reporting.
+    """
+    from .registry_sync import (
+        _is_excluded_device,
+        _is_excluded_domain,
+        _async_entry_domain,
+    )
+
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+    fingerprints: dict[str, str] = {}
+
+    for device in device_registry.devices.values():
+        if _is_excluded_device(hass, device, entry.entry_id):
+            continue
+        if entry.entry_id in device.config_entries:
+            continue  # already bound to this gateway — not re-inferred
+        has_available = False
+        entity_parts: list[str] = []
+        for ent in er.async_entries_for_device(entity_registry, device.id):
+            if ent.disabled_by is not None:
+                continue
+            if _is_excluded_domain(_async_entry_domain(hass, ent.config_entry_id)):
+                continue
+            state = hass.states.get(ent.entity_id)
+            attrs = state.attributes if state is not None else {}
+            if _state_is_available(state):
+                has_available = True
+            entity_parts.append(
+                "|".join(
+                    [
+                        ent.entity_id,
+                        ent.domain,
+                        str(ent.device_class or ent.original_device_class or ""),
+                        str(ent.entity_category.value if ent.entity_category else ""),
+                        str(attrs.get("supported_features", "")),
+                        ",".join(sorted(str(k) for k in attrs.keys())),
+                    ]
+                )
+            )
+        if not entity_parts or not has_available:
+            continue
+        parts = [
+            device.name_by_user or device.name or "",
+            device.model or "",
+            device.manufacturer or "",
+            *sorted(entity_parts),
+        ]
+        fingerprints[device.id] = hashlib.sha1(
+            "\x1e".join(parts).encode("utf-8")
+        ).hexdigest()
+
+    return fingerprints
+
+
 async def async_publish_eligible_ha_devices(
     hass: HomeAssistant,
     entry: TuyaHaNewConfigEntry,
+    *,
+    allow_rule_refresh: bool = True,
 ) -> None:
     """Scan HA registries and publish eligible sub-devices via MQTT (Step 4).
+
+    Uses pidspec inference first: high-confidence devices get pidspec product_id.
+    Devices not covered by pidspec fall back to mapping-based PID resolution.
+    Low-confidence devices are collected for cloud reporting.
 
     Publishes to tylink/${deviceId}/ha/devices so the app can show
     the user which HA devices are available for binding.
@@ -1907,26 +2184,32 @@ async def async_publish_eligible_ha_devices(
         _is_excluded_domain,
         _async_entry_domain,
     )
+    from .pidspec_bridge import _infer_pidspec_with_diagnosis
 
     runtime_data = getattr(entry, "runtime_data", None)
     if runtime_data is None or not hasattr(runtime_data, "publish_ha_devices"):
         LOGGER.debug("Cannot publish HA devices: no MQTT client")
         return
 
-    await async_ensure_pid_mapping_loaded(hass)
-
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
     area_registry = ar.async_get(hass)
     ha_devices: list[dict[str, str]] = []
+    low_confidence_results: dict[str, Any] = {}
+    matched_results: list[Any] = []
 
     for device in device_registry.devices.values():
         if _is_excluded_device(hass, device, entry.entry_id):
+            continue
+        # Skip devices already bound to this gateway — they are not candidates
+        # for (re-)binding and don't need re-inference / low-confidence report.
+        if entry.entry_id in device.config_entries:
             continue
 
         # Collect all entity domains for this device.
         entity_domains: set[str] = set()
         has_available_entity = False
+        entity_state_summary: list[str] = []
         for entity_entry in er.async_entries_for_device(entity_registry, device.id):
             if entity_entry.disabled_by is not None:
                 continue
@@ -1935,87 +2218,249 @@ async def async_publish_eligible_ha_devices(
             entity_domains.add(entity_entry.domain)
             if not has_available_entity:
                 state = hass.states.get(entity_entry.entity_id)
+                st = state.state if state is not None else "<missing>"
+                entity_state_summary.append(f"{entity_entry.entity_id}={st}")
                 if _state_is_available(state):
                     has_available_entity = True
 
         if not entity_domains or not has_available_entity:
-            LOGGER.debug(
-                "publish_eligible: skip device %s (%s): entity_domains=%s has_available=%s",
+            LOGGER.info(
+                "publish_eligible: skip device %s (%s): entity_domains=%s has_available=%s\n"
+                "  entity_states: %s",
                 device.id, device.name, entity_domains, has_available_entity,
+                ", ".join(entity_state_summary) if entity_state_summary else "(none)",
             )
             continue
 
-        # Pick the highest-priority domain, then check cloud PID mapping.
-        from .mapping_runtime import _PID_MAPPING_CACHE
-        selected_domain = infer_domain_for_device(entity_domains)
-        if not selected_domain:
-            LOGGER.debug(
-                "publish_eligible: skip device %s (%s): infer_domain returned None for domains=%s, "
-                "PID_CACHE_keys=%s",
-                device.id, device.name, entity_domains,
-                list(_PID_MAPPING_CACHE.keys()) if _PID_MAPPING_CACHE else "None",
-            )
+        # --- pidspec-first: try inference to get product_id ---
+        discovery_result, diagnosis, infer_result = _infer_pidspec_with_diagnosis(
+            hass, device.id
+        )
+        LOGGER.info(
+            "publish_eligible: pidspec %s → %s (name=%s)",
+            device.id, diagnosis, device.name,
+        )
+        if discovery_result is not None:
+            ha_device: dict[str, str] = {
+                "productId": discovery_result.product_id,
+                "clientId": device.id,
+                "deviceName": device.name_by_user or device.name or device.id,
+                "deviceType": discovery_result.category_code,
+            }
+            if device.area_id:
+                area_entry = area_registry.async_get_area(device.area_id)
+                if area_entry is not None:
+                    ha_device["area"] = area_entry.name
+            ha_devices.append(ha_device)
+            matched_results.append(discovery_result)
             continue
 
-        if not await async_ensure_mapping_module_loaded(hass, selected_domain):
-            LOGGER.debug(
-                "publish_eligible: skip device %s (%s): no mapping module for domain=%s",
-                device.id, device.name, selected_domain,
-            )
-            continue
-
-        # Infer the best category (and thus PID) for this device,
-        # using the same keyword/attribute logic as registry_sync.
-        candidates = get_category_candidates_for_domain(selected_domain)
-        product_id: str | None = None
-        if candidates and len(candidates) > 1:
-            primary_entity_id: str | None = None
-            for entity_entry in er.async_entries_for_device(entity_registry, device.id):
-                if entity_entry.disabled_by is not None:
-                    continue
-                if entity_entry.domain == selected_domain:
-                    primary_entity_id = entity_entry.entity_id
-                    break
-            if primary_entity_id is not None:
-                inferred = infer_category_for_entity(
-                    hass, primary_entity_id, candidates,
-                    device_name=device.name,
-                    device_model=device.model,
-                    device_manufacturer=device.manufacturer,
-                )
-                if inferred is not None:
-                    for c in candidates:
-                        if c.category_code == inferred.category_code:
-                            product_id = c.product_id
-                            break
-        if product_id is None:
-            product_id = get_product_id_for_domain(selected_domain)
-        if not product_id:
-            LOGGER.debug(
-                "publish_eligible: skip device %s (%s): no product_id for domain=%s",
-                device.id, device.name, selected_domain,
-            )
-            continue
-
-        ha_device: dict[str, str] = {
-            "productId": product_id,
-            "clientId": device.id,
-            "deviceName": device.name_by_user or device.name or device.id,
-            "deviceType": selected_domain,
-        }
-
-        if device.area_id:
-            area_entry = area_registry.async_get_area(device.area_id)
-            if area_entry is not None:
-                ha_device["area"] = area_entry.name
-
-        ha_devices.append(ha_device)
+        # pidspec didn't match — report to cloud for rule generation.
+        # Forward the REAL inference result (signal + candidates) so the cloud
+        # Skill can route correctly. Fall back to a synthetic result only when
+        # inference produced none (cache empty / no profile).
+        LOGGER.debug(
+            "publish_eligible: device %s (%s) pidspec no match, domains=%s → low_confidence",
+            device.id, device.name, entity_domains,
+        )
+        low_confidence_results[device.id] = infer_result
 
     LOGGER.debug(
-        "publish_eligible: total_devices=%d, eligible=%d",
-        len(device_registry.devices), len(ha_devices),
+        "publish_eligible: total_devices=%d, eligible=%d, low_confidence=%d",
+        len(device_registry.devices), len(ha_devices), len(low_confidence_results),
     )
     runtime_data.publish_ha_devices(ha_devices)
+
+    # Print high-confidence matched devices (PID + DP routes) for visibility.
+    # Placed AFTER inference is done and BEFORE low-confidence reporting, per
+    # operator request — gives a snapshot of what pidspec successfully inferred
+    # before the cloud-report step runs.
+    if matched_results:
+        lines: list[str] = []
+        for r in matched_results:
+            # Find the matching ha_device dict to pull display name
+            display_name = next(
+                (
+                    d["deviceName"]
+                    for d in ha_devices
+                    if d["clientId"] == r.ha_device_id
+                ),
+                r.ha_device_id,
+            )
+            lines.append(
+                f"  ✓ {r.ha_device_id} (name={display_name}) → "
+                f"product_id={r.product_id} category={r.category_code} "
+                f"dp_routes={len(r.routes)}"
+            )
+            for route in r.routes:
+                lines.append(
+                    f"      {route.dpcode:<24} → {route.entity_id:<48} "
+                    f"({route.domain}/{route.direction}, "
+                    f"converter={route.converter}, component={route.component})"
+                )
+        LOGGER.info(
+            "publish_eligible: %d high-confidence devices (PID + DP routes):\n%s",
+            len(matched_results),
+            "\n".join(lines),
+        )
+
+    # Report low-confidence devices to cloud for rule generation.
+    # Lazy rule refresh: local rules are tried first; only when inference still
+    # leaves low-confidence devices do we pull the latest cloud rules. If newer
+    # rules arrive, re-infer once with the updated cache (without refreshing
+    # again) — that re-run reports whatever is still low-confidence. The cloud
+    # does not aggregate, so each report carries the full current set.
+    if low_confidence_results:
+        if allow_rule_refresh:
+            rules_updated = await async_check_and_refresh_pidspec_rules(
+                hass, entry, republish=False
+            )
+            if rules_updated:
+                LOGGER.info(
+                    "publish_eligible: %d low-confidence device(s) with local "
+                    "rules, fetched newer cloud rules → re-inferring",
+                    len(low_confidence_results),
+                )
+                await async_publish_eligible_ha_devices(
+                    hass, entry, allow_rule_refresh=False
+                )
+                return
+        await _async_report_low_confidence_devices(hass, low_confidence_results)
+
+
+async def _async_report_low_confidence_devices(
+    hass: HomeAssistant,
+    infer_results: dict[str, Any],
+) -> None:
+    """Report devices that pidspec couldn't match to cloud for rule generation.
+
+    *infer_results* maps ha_device_id → the real PidInferResult produced by
+    inference (carrying the true low_confidence_signal — filter_empty /
+    score_low / margin_tight / insufficient_domain_coverage — and the scored
+    candidates). These are forwarded verbatim so the cloud Skill's decision
+    routing can act on them. A device whose inference produced no result
+    (value None — cache empty / no profile at scan time) falls back to a
+    synthetic no_pidspec_match result so it is still surfaced for human review.
+    """
+    from .pidspec_bridge import get_rule_cache, _get_domain_data, _PIDSPEC_CLOUD_CLIENT
+    from .device_profiling import async_build_device_profile
+    from .pidspec.models import PidInferResult
+    from .pidspec.orchestrator import build_low_confidence_report_payload
+
+    domain_data = _get_domain_data(hass)
+    cloud_client = domain_data.get(_PIDSPEC_CLOUD_CLIENT)
+    if cloud_client is None:
+        return
+
+    cache = get_rule_cache(hass)
+    if cache is None:
+        return
+
+    device_profiles: dict[str, Any] = {}
+    results: dict[str, PidInferResult] = {}
+    for device_id, infer_result in infer_results.items():
+        profile = async_build_device_profile(hass, device_id, cache)
+        if profile is None:
+            continue
+        device_profiles[device_id] = profile
+        results[device_id] = infer_result if infer_result is not None else PidInferResult(
+            status="needs_cloud_upgrade",
+            reason="no_pidspec_match",
+            low_confidence_signal="discovery_fallback",
+        )
+
+    if not device_profiles:
+        return
+
+    report_payload = await build_low_confidence_report_payload(
+        device_profiles, results, hass=hass
+    )
+
+    try:
+        await cloud_client.async_report_low_confidence(
+            report_payload,
+            local_rule_version=cache.rule_version,
+            trigger="plugin_start",
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning(
+            "publish_eligible: failed to report low-confidence devices: %s", exc
+        )
+
+
+async def async_check_and_refresh_pidspec_rules(
+    hass: HomeAssistant,
+    entry: TuyaHaNewConfigEntry,
+    *,
+    republish: bool = True,
+) -> bool:
+    """Check cloud rule version; if newer, fetch bundle, update cache, persist.
+
+    Called periodically (1 hour) and by publish_eligible's lazy rule refresh.
+    Flow:
+    1. Get cloud rule version
+    2. If cloud > local → fetch bundle → update cache → persist
+    3. If *republish* → re-publish eligible devices (triggers re-inference)
+
+    Returns True when the rule cache was updated to a newer version, False
+    otherwise (no newer version, fetch failure, or parse failure). The lazy
+    caller passes ``republish=False`` and drives its own re-inference.
+    """
+    from .pidspec_bridge import get_rule_cache, _get_domain_data, _PIDSPEC_CLOUD_CLIENT
+    from .pidspec.rule_cache import LocalRuleCache
+    from .rules import async_save_rules_bundle
+
+    domain_data = _get_domain_data(hass)
+    cloud_client = domain_data.get(_PIDSPEC_CLOUD_CLIENT)
+    if cloud_client is None:
+        LOGGER.debug("rule_check: no cloud client configured, skipping")
+        return False
+
+    cache: LocalRuleCache | None = get_rule_cache(hass)
+    if cache is None:
+        LOGGER.debug("rule_check: no rule cache initialized, skipping")
+        return False
+
+    try:
+        cloud_version = await cloud_client.async_get_rule_version()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("rule_check: failed to check cloud rule version: %s", exc)
+        return False
+
+    if cloud_version <= cache.rule_version:
+        LOGGER.debug(
+            "rule_check: cloud version %d <= local %d, no update needed",
+            cloud_version, cache.rule_version,
+        )
+        return False
+
+    LOGGER.info(
+        "rule_check: cloud version %d > local %d, fetching new rules",
+        cloud_version, cache.rule_version,
+    )
+
+    try:
+        bundle = await cloud_client.async_fetch_rules_bundle()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("rule_check: failed to fetch rules bundle: %s", exc)
+        return False
+
+    if not cache.load_from_bundle(bundle):
+        LOGGER.warning("rule_check: failed to parse fetched bundle")
+        return False
+
+    await async_save_rules_bundle(bundle)
+    LOGGER.info(
+        "rule_check: rules updated to version %d (%d pidspecs)%s",
+        cache.rule_version,
+        len(cache.pidspecs),
+        ", re-publishing eligible" if republish else "",
+    )
+    if republish:
+        await async_publish_eligible_ha_devices(
+            hass, entry, allow_rule_refresh=False
+        )
+    return True
 
 
 async def async_handle_subdevice_to_bind(
@@ -2036,7 +2481,10 @@ async def async_handle_subdevice_to_bind(
     entries) is deferred to async_handle_subdevice_bind_response, which
     runs only when the cloud returns code=0.
     """
-    from .mapping_runtime import get_supported_domains_in_order
+    from .pidspec_bridge import (
+        pidspec_build_default_properties,
+        pidspec_resolve_bind,
+    )
 
     try:
         message = json.loads(payload)
@@ -2054,8 +2502,6 @@ async def async_handle_subdevice_to_bind(
     if runtime_data is None or not hasattr(runtime_data, "publish_subdevice_bind"):
         LOGGER.warning("Cannot handle topo/add/notify: no MQTT client")
         return
-
-    await async_ensure_pid_mapping_loaded(hass)
 
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
@@ -2083,92 +2529,27 @@ async def async_handle_subdevice_to_bind(
 
         device_name = device.name_by_user or device.name or device.id
 
-        # Find the matching domain and category_code for this product_id
-        selected_domain: str | None = None
-        selected_category_code: str = ""
-        for domain in get_supported_domains_in_order():
-            for candidate in get_category_candidates_for_domain(domain):
-                if candidate.product_id == product_id:
-                    selected_domain = domain
-                    selected_category_code = candidate.category_code
-                    break
-            if selected_domain:
-                break
-
-        if not selected_domain:
-            LOGGER.debug(
-                "topo/add/notify: no domain found for productId=%s clientId=%s",
-                product_id, client_id,
-            )
-            continue
-
-        # Gather entity state for defaultProperties
-        selected_entities: list[str] = []
-        primary_entity_id: str | None = None
-
-        for entity_entry in er.async_entries_for_device(entity_registry, device.id):
-            if entity_entry.disabled_by is not None:
-                continue
-            if entity_entry.domain != selected_domain:
-                continue
-            selected_entities.append(entity_entry.entity_id)
-            if primary_entity_id is None:
-                primary_entity_id = entity_entry.entity_id
-
-        if not selected_entities or primary_entity_id is None:
-            LOGGER.debug(
-                "topo/add/notify: no matching entities for clientId=%s domain=%s",
-                client_id, selected_domain,
-            )
-            continue
-
-        # Build defaultProperties from current entity state
-        default_properties: list[dict[str, Any]] = []
-        topo_category_code = selected_category_code or None
-        await async_ensure_mapping_module_loaded(hass, selected_domain, topo_category_code)
-        metadata = get_property_metadata(selected_domain, topo_category_code)
-        entity_state = hass.states.get(primary_entity_id)
         context = _build_mapping_context(hass)
-        reported_codes: set[str] = set()
-        if entity_state is not None and _state_can_be_reported(entity_state):
-            properties = build_tuya_properties_from_state(
-                selected_domain, entity_state, topo_category_code, context=context
-            )
-            if properties:
-                for k, v in properties.items():
-                    reported_codes.add(k)
-                    value = v["value"]
-                    meta = metadata.get(k, {})
-                    # Apply value_map to convert Tuya values to HA values
-                    if "value_map" in meta:
-                        value = meta["value_map"].get(value, value)
-                    prop = _build_default_property_payload(
-                        hass,
-                        primary_entity_id,
-                        k,
-                        metadata,
-                        context,
-                        value,
-                    )
-                    default_properties.append(prop)
+        default_properties: list[dict[str, Any]] = []
 
-        # Append metadata-defined properties not already reported by
-        # ha_to_tuya (e.g. mode when the entity state lacks that attribute)
-        # so that Tuya cloud still receives their dpProperties.
-        if metadata:
-            for code in metadata:
-                if code in reported_codes:
-                    continue
-                prop = _build_default_property_payload(
-                    hass,
-                    primary_entity_id,
-                    code,
-                    metadata,
-                    context,
-                )
-                if "dpProperties" not in prop:
-                    continue
-                default_properties.append(prop)
+        # PID-first: the cloud already told us the productId, so resolve that
+        # spec's DP routes for this HA device and build the physical model
+        # (defaultProperties: min/max/step/range) from each route's typespec +
+        # the carrier entity's live capabilities — no legacy mapping metadata.
+        bind_result = pidspec_resolve_bind(hass, client_id, product_id, "")
+        if bind_result is None:
+            # pidspec is the only bind path (mirrors bind_response/topo-get):
+            # if no PidSpec resolves, skip binding rather than fall back to the
+            # retired legacy mapping layer.
+            LOGGER.warning(
+                "topo/add/notify: pidspec cannot resolve clientId=%s productId=%s; "
+                "skipping bind (legacy mapping retired)",
+                client_id, product_id,
+            )
+            continue
+        default_properties = pidspec_build_default_properties(
+            hass, bind_result.route_table, context
+        )
 
         bind_child: dict[str, Any] = {
             "productId": product_id,
@@ -2216,6 +2597,11 @@ async def _async_send_immediate_property_report(
     If *tuya_command_data* is provided, explicitly commanded property
     values (e.g. ``work_mode``) are merged into the report so the cloud
     sees the mode that was requested, not the stale HA-side mode.
+
+    Mirrors the full-state report paths: PID-level full-device payload is
+    primary, legacy single-entity mapping is the fallback (no route table).
+    Keeping this consistent with _async_flush_device_report avoids the ACK
+    and the debounced flush disagreeing on a DP (e.g. water_heater switch).
     """
     runtime_data = getattr(entry, "runtime_data", None)
     if runtime_data is None or not hasattr(
@@ -2223,15 +2609,21 @@ async def _async_send_immediate_property_report(
     ):
         return
 
-    entity_state = hass.states.get(entity_id)
-    if entity_state is None or not _state_can_be_reported(entity_state):
-        return
-
-    await async_ensure_mapping_module_loaded(hass, domain, category_code)
     context = _build_mapping_context(hass, runtime_data, tuya_device_id)
-    properties = build_tuya_properties_from_state(
-        domain, entity_state, category_code, context=context
+
+    # Primary path: assemble the COMPLETE PID payload from all bound entities.
+    properties = pidspec_build_full_device_properties(
+        hass, tuya_device_id, context=context
     )
+    if properties is None:
+        # Binding is pidspec-gated; a missing route table means the device is
+        # not (or no longer) pidspec-bound. Skip rather than use legacy mapping.
+        LOGGER.warning(
+            "ack report: no pidspec route table for tuya_device_id=%s; "
+            "skipping (legacy mapping retired)",
+            tuya_device_id,
+        )
+        return
     if not properties:
         return
     # Override reported values with explicitly commanded properties so the
@@ -2307,7 +2699,6 @@ async def async_handle_subdevice_message(
         if not (domain := _device_bound_domain(bindings, device_data)):
             return
         category_code = _device_bound_category_code(bindings, device_data) or None
-        await async_ensure_mapping_module_loaded(hass, domain, category_code)
         if (
             domain == "cover"
             and "control" in message["data"]
@@ -2316,13 +2707,19 @@ async def async_handle_subdevice_message(
             runtime_data.remember_child_cover_command(
                 tuya_device_id, message["data"]["control"]
             )
-        if service_calls := build_service_calls_from_tuya(
-            domain,
-            message["data"],
-            entity_id,
-            category_code=category_code,
-            context=_build_mapping_context(hass, runtime_data, tuya_device_id),
-        ):
+        context = _build_mapping_context(hass, runtime_data, tuya_device_id)
+        service_calls = pidspec_build_service_calls(
+            hass, tuya_device_id, message["data"], entity_id, context=context
+        )
+        if service_calls is None:
+            # Binding is pidspec-gated; a missing route table means the device is
+            # not pidspec-bound. Skip rather than route via legacy mapping.
+            LOGGER.warning(
+                "inbound command: no pidspec route table for tuya_device_id=%s; "
+                "dropping command (legacy mapping retired)",
+                tuya_device_id,
+            )
+        if service_calls:
             LOGGER.debug(
                 "Routing Tuya child property set tuya_device_id=%s "
                 "ha_device_id=%s entity_id=%s domain=%s service_calls=%s data=%s" ,
@@ -2485,17 +2882,22 @@ async def async_setup_entry(
         # Gateway not created yet; integration is loaded but no MQTT.
         return True
 
-    # Refresh category_code-PID mappings from cloud on every setup (restart/reload).
     api_key = credentials.get(CONF_API_KEY)
-    if isinstance(api_key, str) and api_key:
-        await async_load_pid_mapping_from_cloud(hass, api_key)
-    else:
-        await async_ensure_pid_mapping_loaded(hass)
-    if get_product_id_for_domain("light") is None and get_product_id_for_domain("switch") is None:
-        LOGGER.warning(
-            "PID mapping cache is empty after setup — "
-            "device/list/found will not be published until mappings are loaded"
-        )
+
+    # Initialize pidspec inference engine (loads local rules, sets up cloud client)
+    await async_init_pidspec(
+        hass,
+        api_key if isinstance(api_key, str) else None,
+        gateway_id=device_id if isinstance(device_id, str) else None,
+    )
+
+    # Startup rule sync (doc §3.1 timing 1): unconditionally check the cloud rule
+    # version and pull a newer bundle, so a restart always lands on the latest
+    # rules even when local rules are non-empty (async_init_pidspec only
+    # bootstraps from cloud when the local cache is EMPTY). republish=False — the
+    # topo/get inference pass later in this setup runs against the fresh cache.
+    await async_check_and_refresh_pidspec_rules(hass, entry, republish=False)
+
     def on_connect() -> None:
         hass.loop.call_soon_threadsafe(
             lambda: hass.async_create_task(
@@ -2546,38 +2948,47 @@ async def async_setup_entry(
             ) from err
     entry.runtime_data = client
 
-    # Try to load existing bindings for this entry.  If none exist, check
-    # for orphaned bindings left by a previous entry (remove + re-add
-    # scenario) and migrate them to the current entry_id.
-    stored_bindings = await async_load_gateway_bindings(hass, entry.entry_id)
-    if not stored_bindings:
-        stored_bindings = await async_migrate_gateway_bindings(
-            hass, entry.entry_id
-        )
+    # No local bindings are loaded here: bindings are not persisted to disk.
+    # The Tuya cloud topo/get is the single source of truth — the initial sync
+    # below pulls the historically-bound sub-devices from the cloud and
+    # async_handle_topo_get_response rebuilds the in-memory bindings (filter +
+    # inference → unbind non-conforming / bind + subscribe conforming). A short
+    # initialization window after startup/binding is expected and accepted.
 
-    if stored_bindings:
-        for device_data in stored_bindings.get("devices", {}).values():
-            tuya_device_id = device_data.get("tuya_device_id")
-            if isinstance(tuya_device_id, str) and tuya_device_id:
-                client.subscribe_child_device_messages(tuya_device_id)
-
-    # Delay the initial sync (topo sync, online report) so the HA frontend
-    # finishes rendering the config-flow completion dialog before any
-    # devices get associated with the config entry. `topo/get_response`
-    # will publish the eligible device list after cloud reconciliation.
+    # Initial topo/get sync timing:
+    # - Cold-start (HA still booting): wait for EVENT_HOMEASSISTANT_STARTED so
+    #   all other integrations finish async_setup_entry, then a grace delay
+    #   (_POST_STARTED_GRACE_SECONDS) so their entities populate live state.
+    #   Running topo/get too early misreads pending-state entities as offline
+    #   (state==None or STATE_UNAVAILABLE) and unbinds good devices.
+    # - Hot reload (HA already running): the cold-start race doesn't apply;
+    #   keep the short _INITIAL_SYNC_DELAY_SECONDS so the config-flow dialog
+    #   finishes rendering before bindings appear on the integration page.
+    # Online and state reports are deferred to async_handle_topo_get_response
+    # so they run AFTER cloud reconciliation.
     async def _async_initial_sync(_now: Any) -> None:
-        """Run the initial sync after a short delay.
-
-        Online report and state report are deferred to
-        async_handle_topo_get_response so they run AFTER cloud
-        reconciliation, avoiding reports for devices the cloud has
-        already deleted.
-        """
         await async_request_topo_sync(hass, entry)
 
-    entry.async_on_unload(
-        async_call_later(hass, _INITIAL_SYNC_DELAY_SECONDS, _async_initial_sync)
-    )
+    if hass.state == CoreState.running:
+        entry.async_on_unload(
+            async_call_later(
+                hass, _INITIAL_SYNC_DELAY_SECONDS, _async_initial_sync
+            )
+        )
+    else:
+        @callback
+        def _on_ha_started(_event: Event) -> None:
+            entry.async_on_unload(
+                async_call_later(
+                    hass, _POST_STARTED_GRACE_SECONDS, _async_initial_sync
+                )
+            )
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED, _on_ha_started
+            )
+        )
 
     # Periodic cloud topo sync every TOPO_SYNC_INTERVAL_SECONDS (1 hour).
     async def _async_periodic_topo_sync(_now: Any) -> None:
@@ -2605,9 +3016,41 @@ async def async_setup_entry(
         )
     )
 
+    # Periodic pidspec rule version check — fetch new rules and re-infer.
+    async def _async_periodic_rule_check(_now: Any) -> None:
+        """Check cloud rule version; if newer, fetch and re-publish eligible."""
+        await async_check_and_refresh_pidspec_rules(hass, entry)
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass,
+            _async_periodic_rule_check,
+            timedelta(seconds=RULE_CHECK_INTERVAL_SECONDS),
+        )
+    )
+
     async def _async_resync_gateway_devices() -> None:
-        """Run a full resync for registry-driven updates."""
+        """Run a resync for registry-driven updates.
+
+        Binding maintenance (refresh stored name/entities, re-associate config
+        entry, prune stale bindings for already-bound devices) ALWAYS runs — it
+        is local and cheap, and skipping it would regress rename/entity-change
+        handling. Inference + cloud reporting only runs when an inferable
+        device's structural fingerprint actually changed, so cosmetic registry
+        churn no longer re-infers and re-reports low-confidence devices.
+        publish_eligible itself lazily fetches newer cloud rules when it still
+        finds low-confidence devices, so no explicit rule check is needed here.
+        """
         await async_sync_gateway_devices_for_entry(hass, entry)
+        fingerprints = _compute_device_fingerprints(hass, entry)
+        if fingerprints == _DEVICE_FINGERPRINTS.get(entry.entry_id):
+            LOGGER.debug(
+                "resync: inferable device profiles unchanged (%d devices), "
+                "skipping re-inference",
+                len(fingerprints),
+            )
+            return
+        _DEVICE_FINGERPRINTS[entry.entry_id] = fingerprints
         await async_publish_eligible_ha_devices(hass, entry)
 
     sync_debouncer = Debouncer(
@@ -2625,7 +3068,12 @@ async def async_setup_entry(
             er.EventEntityRegistryUpdatedData | dr.EventDeviceRegistryUpdatedData
         ],
     ) -> None:
-        """Schedule a debounced registry resync."""
+        """Schedule a debounced registry resync.
+
+        Registry events (entity/device updated) always trigger resync.
+        State changes only trigger resync on availability transitions
+        (online↔offline); regular state changes just report to Tuya.
+        """
         if event.event_type == EVENT_STATE_CHANGED:
             entity_id = event.data.get("entity_id")
             if isinstance(entity_id, str):
@@ -2647,9 +3095,24 @@ async def async_setup_entry(
                         event.data.get("new_state"),
                     )
                 )
+            # Only trigger resync+inference on availability change
+            old_state = event.data.get("old_state")
+            new_state = event.data.get("new_state")
+            if _state_is_available(old_state) != _state_is_available(new_state):
+                sync_debouncer.async_schedule_call()
+            return
+
+        # Registry events always trigger resync
         sync_debouncer.async_schedule_call()
 
     entry.async_on_unload(sync_debouncer.async_shutdown)
+
+    @callback
+    def _async_drop_device_fingerprints() -> None:
+        """Drop cached fingerprints on unload (must not return the popped dict)."""
+        _DEVICE_FINGERPRINTS.pop(entry.entry_id, None)
+
+    entry.async_on_unload(_async_drop_device_fingerprints)
     entry.async_on_unload(
         hass.bus.async_listen(
             er.EVENT_ENTITY_REGISTRY_UPDATED,
@@ -2772,7 +3235,6 @@ async def async_unload_entry(
         handle = _pending_device_reports.pop(key, None)
         if handle is not None:
             handle.cancel()
-        _pending_device_old_states.pop(key, None)
 
     client = getattr(entry, "runtime_data", None)
     if client:
@@ -2788,9 +3250,9 @@ async def async_remove_entry(
 
     The cloud delete only unbinds the gateway from the family — sub-device
     relationships are preserved server-side and can be queried via
-    ``tylink/${deviceId}/device/topo/get``.  Therefore we intentionally keep
-    local bindings and credentials so they can be restored when the user
-    re-adds the integration.
+    ``tylink/${deviceId}/device/topo/get``.  Bindings are not persisted to
+    disk, so we just drop the in-memory map for this entry; a subsequent
+    re-integration rebuilds bindings from the cloud topo/get.
     """
     from .tuya_openapi import TuyaOpenApiError, async_delete_ha_gateway
 
@@ -2813,6 +3275,7 @@ async def async_remove_entry(
                 device_id,
             )
 
-    # Intentionally keep gateway_bindings and gateway_credentials on disk
-    # so that a subsequent re-integration can restore the sub-device
-    # mapping without requiring the user to re-bind every device.
+    # Drop in-memory bindings for this entry. Credentials remain on disk so a
+    # re-integration can reuse the same virtual gateway; the sub-device
+    # mappings are rebuilt from the cloud topo/get, not from local state.
+    await async_delete_gateway_bindings(hass, entry.entry_id)

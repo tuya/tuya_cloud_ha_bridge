@@ -14,14 +14,21 @@ from .const import (
     CONF_DEVICE_SECRET,
     CONF_PRODUCT_ID,
     CONF_QR_CODE_DATA,
+    DOMAIN,
     LOGGER,
     LOCAL_CREDENTIALS_FILE,
 )
 
-_BINDINGS_STORAGE_VERSION = 1
-_BINDINGS_STORAGE_KEY = f"{LOCAL_CREDENTIALS_FILE}.bindings"
 _CREDENTIALS_STORAGE_VERSION = 1
 _CREDENTIALS_STORAGE_KEY = f"{LOCAL_CREDENTIALS_FILE}.credentials"
+
+# Gateway bindings are intentionally NOT persisted to disk. The Tuya cloud
+# topo/get is the single source of truth: on every HA startup the in-memory
+# map below starts empty and is rebuilt from the cloud during topo
+# reconciliation (filter + inference → unbind non-conforming / bind
+# conforming). This keeps cloud and local state consistent and removes the
+# stale-cache class of bugs. Keyed by config-entry id inside hass.data.
+_BINDINGS_RUNTIME_KEY = f"{DOMAIN}_gateway_bindings"
 
 
 class GatewayCredentials(TypedDict):
@@ -83,14 +90,14 @@ def _get_legacy_credentials_path(hass: HomeAssistant) -> str:
     return hass.config.path(LOCAL_CREDENTIALS_FILE)
 
 
-def _get_bindings_store(hass: HomeAssistant) -> Store[dict[str, GatewayBindingsData]]:
-    """Return the storage helper used for gateway bindings."""
-    return Store[dict[str, GatewayBindingsData]](
-        hass,
-        _BINDINGS_STORAGE_VERSION,
-        _BINDINGS_STORAGE_KEY,
-        private=True,
-    )
+def _get_bindings_memory(hass: HomeAssistant) -> dict[str, GatewayBindingsData]:
+    """Return the in-memory bindings map (keyed by config-entry id).
+
+    Bindings live only for the lifetime of the HA process — they are rebuilt
+    from the Tuya cloud (topo/get) on startup, so there is no disk persistence
+    and nothing to migrate across a remove/re-add.
+    """
+    return hass.data.setdefault(_BINDINGS_RUNTIME_KEY, {})
 
 
 def _normalize_credentials(data: dict[str, object] | None) -> GatewayStorageData | None:
@@ -192,64 +199,21 @@ async def async_delete_gateway_credentials(hass: HomeAssistant) -> None:
 async def async_load_gateway_bindings(
     hass: HomeAssistant, entry_id: str
 ) -> GatewayBindingsData | None:
-    """Load persisted gateway binding data."""
-    store_data = await _get_bindings_store(hass).async_load()
-    if store_data is None:
-        return None
-    return store_data.get(entry_id)
+    """Return the in-memory gateway binding data for an entry (None if absent).
+
+    Kept ``async`` for call-site compatibility; the cloud topo/get
+    reconciliation is the single source of truth that populates this map.
+    """
+    return _get_bindings_memory(hass).get(entry_id)
 
 
 async def async_save_gateway_bindings(
     hass: HomeAssistant, entry_id: str, data: GatewayBindingsData
 ) -> None:
-    """Persist gateway binding data."""
-    store = _get_bindings_store(hass)
-    store_data = await store.async_load() or {}
-    store_data[entry_id] = data
-    await store.async_save(store_data)
+    """Store gateway binding data in memory (no disk persistence)."""
+    _get_bindings_memory(hass)[entry_id] = data
 
 
 async def async_delete_gateway_bindings(hass: HomeAssistant, entry_id: str) -> None:
-    """Delete persisted gateway binding data for one entry."""
-    store = _get_bindings_store(hass)
-    store_data = await store.async_load() or {}
-    if entry_id not in store_data:
-        return
-
-    del store_data[entry_id]
-    await store.async_save(store_data)
-
-
-async def async_migrate_gateway_bindings(
-    hass: HomeAssistant, new_entry_id: str
-) -> GatewayBindingsData | None:
-    """Migrate bindings from a previous (orphaned) entry to the new entry.
-
-    When the integration is removed and re-added the entry_id changes.
-    This function finds any orphaned bindings (keyed by the old entry_id),
-    re-keys them under *new_entry_id*, and removes the old key.
-
-    Returns the migrated bindings or ``None`` if nothing was migrated.
-    """
-    store = _get_bindings_store(hass)
-    store_data = await store.async_load()
-    if not store_data:
-        return None
-
-    # If the new entry already has bindings, nothing to migrate.
-    if new_entry_id in store_data:
-        return None
-
-    # Find orphaned bindings — any key that is NOT the new entry.
-    orphaned_entries = [
-        (key, data) for key, data in store_data.items() if key != new_entry_id
-    ]
-    if not orphaned_entries:
-        return None
-
-    # Take the first (and typically only) orphaned entry.
-    old_entry_id, old_bindings = orphaned_entries[0]
-    store_data[new_entry_id] = old_bindings
-    del store_data[old_entry_id]
-    await store.async_save(store_data)
-    return old_bindings
+    """Drop the in-memory gateway binding data for one entry."""
+    _get_bindings_memory(hass).pop(entry_id, None)

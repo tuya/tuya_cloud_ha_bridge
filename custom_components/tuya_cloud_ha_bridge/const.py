@@ -18,9 +18,6 @@ CONF_QR_CODE_DATA = "qr_code_data"
 # OpenAPI gateway creation path
 TUYA_OPENAPI_GATEWAY_ACTIVE_PATH = "/v1.0/end-user/devices/ha/gateway/active"
 TUYA_OPENAPI_SUB_DEVICE_LIMIT_PATH = "/v1.0/end-user/devices/ha/sub/device/limit"
-TUYA_OPENAPI_CATEGORY_PID_MAPPINGS_PATH = (
-    "/v1.0/end-user/services/ha/category/pid/mappings"
-)
 
 
 # Local config file for virtual gateway credentials.
@@ -68,6 +65,9 @@ TUYA_LINK_TOPIC_SUBDEVICE_TO_BIND_RESPONSE = (
 # OpenAPI gateway deletion path
 # Periodic cloud topo sync interval (seconds)
 TOPO_SYNC_INTERVAL_SECONDS = 3600  # 1 hour
+
+# Periodic pidspec rule version check interval (seconds)
+RULE_CHECK_INTERVAL_SECONDS = 3600  # 1 hour
 
 # Maximum sub-device IDs per topo/get request
 TOPO_GET_PAGE_SIZE = 100
