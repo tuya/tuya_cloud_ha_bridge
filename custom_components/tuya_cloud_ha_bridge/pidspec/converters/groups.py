@@ -182,12 +182,26 @@ class LightColorGroupConverter:
         return result
 
 
-def _c_to_f(celsius: float) -> int:
-    return int(round(celsius * 9 / 5 + 32))
+def _c_to_f(celsius: float) -> float:
+    return celsius * 9 / 5 + 32
 
 
-def _f_to_c(fahrenheit: float) -> int:
-    return int(round((fahrenheit - 32) * 5 / 9))
+def _f_to_c(fahrenheit: float) -> float:
+    return (fahrenheit - 32) * 5 / 9
+
+
+def _dp_scale(cfg: dict[str, Any]) -> float:
+    """Scale factor between the Tuya DP integer and the real value.
+
+    Tuya stores temperatures as scaled integers (e.g. scale=10 → DP 255 means
+    25.5 °C). Tuya→HA divides by this factor, HA→Tuya multiplies by it. Absent
+    or invalid config means scale=1 (whole-degree device, legacy behaviour).
+    """
+    try:
+        scale = float(cfg.get("scale", 1))
+    except (TypeError, ValueError):
+        return 1.0
+    return scale if scale > 0 else 1.0
 
 
 class ClimateTempGroupConverter:
@@ -220,28 +234,34 @@ class ClimateTempGroupConverter:
             return []
 
         role_to_dp = {r.converter_config.get("role"): r.dpcode for r in routes}
+        role_to_scale = {
+            r.converter_config.get("role"): _dp_scale(r.converter_config) for r in routes
+        }
         entity_id = routes[0].entity_id
         domain = entity_id.split(".")[0] if "." in entity_id else "climate"
         use_f = context.get("temperature_unit") == "°F" if context else False
 
         # Only setpoint roles control HA; current/unit DPs are read-only and
-        # never reach here (dispatcher drops read-only routes inbound).
+        # never reach here (dispatcher drops read-only routes inbound). Each DP
+        # is de-scaled from the Tuya integer into real degrees before use.
         dp_c = role_to_dp.get("temp_celsius")
         dp_f = role_to_dp.get("temp_fahrenheit")
-        val_c = group_payload.get(dp_c) if dp_c else None
-        val_f = group_payload.get(dp_f) if dp_f else None
+        raw_c = group_payload.get(dp_c) if dp_c else None
+        raw_f = group_payload.get(dp_f) if dp_f else None
+        val_c = float(raw_c) / role_to_scale["temp_celsius"] if raw_c is not None else None
+        val_f = float(raw_f) / role_to_scale["temp_fahrenheit"] if raw_f is not None else None
 
         temp_value = None
         if use_f:
             if val_f is not None:
-                temp_value = int(val_f)
+                temp_value = val_f
             elif val_c is not None:
-                temp_value = _c_to_f(int(val_c))
+                temp_value = _c_to_f(val_c)
         else:
             if val_c is not None:
-                temp_value = int(val_c)
+                temp_value = val_c
             elif val_f is not None:
-                temp_value = _f_to_c(int(val_f))
+                temp_value = _f_to_c(val_f)
 
         if temp_value is None:
             return []
@@ -260,6 +280,9 @@ class ClimateTempGroupConverter:
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         role_to_dp = {r.converter_config.get("role"): r.dpcode for r in routes}
+        role_to_scale = {
+            r.converter_config.get("role"): _dp_scale(r.converter_config) for r in routes
+        }
         use_f = context.get("temperature_unit") == "°F" if context else False
         result: dict[str, Any] = {}
 
@@ -271,14 +294,15 @@ class ClimateTempGroupConverter:
                 value = float(raw)
             except (TypeError, ValueError):
                 return
+            # Real degrees in each unit, then scaled back to the Tuya integer.
             if use_f:
-                c_val, f_val = _f_to_c(value), int(round(value))
+                c_deg, f_deg = _f_to_c(value), value
             else:
-                c_val, f_val = int(round(value)), _c_to_f(value)
+                c_deg, f_deg = value, _c_to_f(value)
             if dpcode := role_to_dp.get(role_c):
-                result[dpcode] = c_val
+                result[dpcode] = int(round(c_deg * role_to_scale[role_c]))
             if dpcode := role_to_dp.get(role_f):
-                result[dpcode] = f_val
+                result[dpcode] = int(round(f_deg * role_to_scale[role_f]))
 
         # Setpoint (HA "temperature") and current temperature, each reported in
         # both °C and °F DPs when those DPs exist.

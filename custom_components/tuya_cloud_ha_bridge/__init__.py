@@ -50,6 +50,7 @@ from .const import (
 from .region_mapping import get_region_endpoints_for_api_key
 from .pidspec_bridge import (
     async_init_pidspec,
+    find_route_table_by_entity,
     get_route_table,
     pidspec_build_full_device_properties,
     pidspec_build_service_calls,
@@ -708,33 +709,38 @@ async def _async_report_bound_entity_state_change(
         new_state,
     )
 
-    if not (bindings := await async_load_gateway_bindings(hass, entry.entry_id)):
+    # Resolve the changed entity to its Tuya device THROUGH the pidspec route
+    # table — the single source of truth for what a device binds. Previously
+    # this gated on the gateway bindings["entities"] map, which is populated by
+    # a separate path and can drift out of sync with the route table after a
+    # topo/get restore (e.g. when duplicate entities exist), silently dropping a
+    # bound entity's state changes. Reverse-looking-up the route table keeps the
+    # trigger consistent with how the report PAYLOAD is built (also route-table
+    # based): any entity the device actually binds can trigger a report.
+    route_table = find_route_table_by_entity(hass, entity_id)
+    if route_table is None:
+        LOGGER.debug(
+            "report-drop[entity_not_in_any_route_table] entity_id=%s",
+            entity_id,
+        )
         return
 
-    if not (entity_data := bindings.get("entities", {}).get(entity_id)):
+    tuya_device_id = route_table.tuya_device_id
+    if not tuya_device_id:
+        LOGGER.debug(
+            "report-drop[no_tuya_device_id] entity_id=%s",
+            entity_id,
+        )
         return
 
-    device_id = entity_data.get("device_id")
-    if not isinstance(device_id, str):
-        return
-
-    device_data = bindings.get("devices", {}).get(device_id)
-    if not isinstance(device_data, dict):
-        return
-
-    # NOTE: do NOT gate on primary_entity_id here. Under the pidspec scheme a
-    # single tuya_device_id maps to a DeviceRouteTable spanning multiple
-    # entities across multiple domains. Any of those entities changing must be
-    # able to trigger a report; gating to the primary entity would silently drop
-    # every secondary entity's change.
-    if not (domain := _device_bound_domain(bindings, device_data)):
-        return
-
-    tuya_device_id = device_data.get("tuya_device_id")
-    if not isinstance(tuya_device_id, str) or not tuya_device_id:
-        return
-
-    category_code = _device_bound_category_code(bindings, device_data) or None
+    # domain/category_code flow through to the flush (currently unused there);
+    # derive them from the route table for continuity.
+    domain = (
+        route_table.primary_entity_id.split(".")[0]
+        if route_table.primary_entity_id
+        else entity_id.split(".")[0]
+    )
+    category_code = route_table.category_code or None
 
     # Coalesce per DEVICE (tuya_device_id), NOT per entity. Tuya expects a
     # FULL-STATE report at the PID level, so when several entities of the same
@@ -752,6 +758,12 @@ async def _async_report_bound_entity_state_change(
         )
         return
 
+    LOGGER.debug(
+        "report-trigger[scheduled] entity_id=%s tuya_device_id=%s domain=%s",
+        entity_id,
+        tuya_device_id,
+        domain,
+    )
     handle = hass.loop.call_later(
         _STATE_REPORT_DEBOUNCE_SECONDS,
         lambda: hass.async_create_task(
@@ -2976,19 +2988,34 @@ async def async_setup_entry(
             )
         )
     else:
+        # async_listen_once self-removes its bus listener when the event fires.
+        # Wrapping that unsub directly in async_on_unload would remove it a
+        # SECOND time at unload → EventBus._async_remove_listener raises
+        # "ValueError: list.remove(x): x not in list". Track the unsub and only
+        # cancel it on unload if EVENT_HOMEASSISTANT_STARTED has NOT fired yet
+        # (entry unloaded mid-startup); once it fires the listener is gone.
+        unsub_ha_started = None
+
         @callback
         def _on_ha_started(_event: Event) -> None:
+            nonlocal unsub_ha_started
+            unsub_ha_started = None  # listener already auto-removed by listen_once
             entry.async_on_unload(
                 async_call_later(
                     hass, _POST_STARTED_GRACE_SECONDS, _async_initial_sync
                 )
             )
 
-        entry.async_on_unload(
-            hass.bus.async_listen_once(
-                EVENT_HOMEASSISTANT_STARTED, _on_ha_started
-            )
+        unsub_ha_started = hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED, _on_ha_started
         )
+
+        @callback
+        def _cancel_ha_started_listener() -> None:
+            if unsub_ha_started is not None:
+                unsub_ha_started()
+
+        entry.async_on_unload(_cancel_ha_started_listener)
 
     # Periodic cloud topo sync every TOPO_SYNC_INTERVAL_SECONDS (1 hour).
     async def _async_periodic_topo_sync(_now: Any) -> None:

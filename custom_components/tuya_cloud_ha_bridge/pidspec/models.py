@@ -183,6 +183,12 @@ class DeviceRouteTable:
     dpcode_to_route: dict[str, DPRoute]
     entity_to_routes: dict[str, list[DPRoute]]
     last_reported_snapshot: dict[str, Any]
+    # DPcodes REQUIRED by the matched spec. The full-report builder (b2) defers
+    # the whole report only when a REQUIRED DP's entity is unreportable; an
+    # unknown OPTIONAL DP entity is emitted as a type default instead of
+    # freezing the whole device. Defaults to empty → callers that don't populate
+    # it get the conservative legacy "defer on any unknown" behaviour.
+    required_dpcodes: frozenset[str] = frozenset()
 
 
 @dataclass

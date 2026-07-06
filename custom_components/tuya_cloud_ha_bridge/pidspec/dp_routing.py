@@ -145,6 +145,7 @@ def build_device_route_table(
         dpcode_to_route=dpcode_to_route,
         entity_to_routes=entity_to_routes,
         last_reported_snapshot={},
+        required_dpcodes=frozenset(spec.required_dps),
     )
 
 
@@ -202,9 +203,15 @@ def _resolve_single_dp(
         if not candidates:
             continue
 
-        # Apply match_hints scoring if present.
+        # Apply match_hints scoring if present. For a featureless target
+        # (features == []) the hints are the ONLY discriminator, so a preferred
+        # keyword match is made mandatory; feature-gated targets keep soft rank.
         if dp_def.match_hints is not None:
-            candidates = _rank_by_match_hints(candidates, dp_def.match_hints)
+            candidates = _rank_by_match_hints(
+                candidates,
+                dp_def.match_hints,
+                require_preferred=not target.features,
+            )
 
         # Pick the first entity that respects the component mutex.
         for entity in candidates:
@@ -295,10 +302,17 @@ def _filter_entities(
 def _rank_by_match_hints(
     entities: list[EntityProfile],
     match_hints,
+    require_preferred: bool = False,
 ) -> list[EntityProfile]:
     """Re-order *entities* so those matching preferred_keywords come first.
 
     Entities whose search text contains any excluded_keyword are removed.
+
+    When *require_preferred* is True and preferred_keywords are declared, an
+    entity matching NONE of them is dropped entirely (not merely ranked last).
+    Callers set this for featureless candidate targets (``features == []``) — a
+    name match is then the only discriminator, so "no preferred hit" means "do
+    not bind" instead of "bind to the first arbitrary same-domain entity".
     """
     preferred = [kw.lower() for kw in (match_hints.preferred_keywords or [])]
     excluded = [kw.lower() for kw in (match_hints.excluded_keywords or [])]
@@ -320,6 +334,13 @@ def _rank_by_match_hints(
             [entity.entity_id, entity.friendly_name, entity.original_name]
         ).lower()
         return sum(1 for kw in preferred if kw in search)
+
+    if require_preferred:
+        # Featureless target: a preferred-keyword hit is mandatory. Drop blind
+        # fall-back candidates so the DP stays UNMATCHED rather than binding to
+        # an arbitrary same-domain entity (e.g. filter_life → a temperature
+        # sensor on a purifier that exposes no filter entity).
+        filtered = [entity for entity in filtered if _score(entity) > 0]
 
     filtered.sort(key=_score, reverse=True)
     return filtered

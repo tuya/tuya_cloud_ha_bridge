@@ -80,6 +80,28 @@ def remove_route_table(hass: HomeAssistant, tuya_device_id: str) -> None:
     tables.pop(tuya_device_id, None)
 
 
+def find_route_table_by_entity(
+    hass: HomeAssistant, entity_id: str
+) -> DeviceRouteTable | None:
+    """Return the route table that binds *entity_id*, or None.
+
+    Reverse lookup across all stored route tables (keyed by tuya_device_id).
+    The pidspec route table is the single source of truth for what a device
+    binds, so the state-change → report trigger resolves an entity to its Tuya
+    device THROUGH this — not the legacy gateway ``bindings["entities"]`` map,
+    which is filled by a separate path and can drift out of sync (e.g. after a
+    topo/get restore that picked a different entity among duplicate entities),
+    silently dropping a bound entity's changes.
+    """
+    tables: dict[str, DeviceRouteTable] = _get_domain_data(hass).get(
+        _PIDSPEC_ROUTE_TABLES, {}
+    )
+    for route_table in tables.values():
+        if entity_id in route_table.entity_ids:
+            return route_table
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Initialization
 # ---------------------------------------------------------------------------
@@ -182,6 +204,31 @@ class PidSpecDiscoveryResult:
     routes: list[DPRoute] = field(default_factory=list)
 
 
+def _unresolved_required_dps(
+    diagnostics: list[dict[str, Any]], spec: PidSpec
+) -> list[dict[str, Any]]:
+    """Return diagnostics for unresolved REQUIRED DPs only.
+
+    A diagnostic whose status != "ok" means that DP failed to bind to an entity.
+    For an OPTIONAL DP that is an EXPECTED outcome — the device simply lacks
+    that capability (e.g. a curtain with no fault sensor for the optional
+    ``sensor_fault`` DP, or an air purifier missing one of its optional sensor
+    DPs) — and must NOT demote / reject / unbind an otherwise-matched device.
+    Only unresolved REQUIRED DPs constitute a real binding failure.
+
+    All route-table consumers (full-property report fill,
+    pidspec_build_default_properties) iterate the route table, never the spec's
+    full DP list, so an optional DP that is simply absent from the routes is
+    handled correctly downstream (it is neither reported nor declared).
+    """
+    required = set(spec.required_dps)
+    return [
+        d
+        for d in diagnostics
+        if d.get("status") != "ok" and d.get("dpcode") in required
+    ]
+
+
 def _infer_pidspec_with_diagnosis(
     hass: HomeAssistant,
     ha_device_id: str,
@@ -242,10 +289,10 @@ def _infer_pidspec_with_diagnosis(
     routes: list[DPRoute] = []
     if matched_spec is not None:
         routes, diagnostics = resolve_dp_routes(profile, matched_spec)
-        # diagnostics includes both successful ("ok") and failed entries; only
-        # count failures as unresolved. Otherwise every successful device would
-        # be misclassified as dp_route_failed.
-        unresolved = [d for d in diagnostics if d.get("status") != "ok"]
+        # Only unresolved REQUIRED DPs are a real failure; unresolved OPTIONAL
+        # DPs (e.g. a curtain without a fault sensor) are expected and must not
+        # misclassify an otherwise-matched device as dp_route_failed.
+        unresolved = _unresolved_required_dps(diagnostics, matched_spec)
         if unresolved:
             resolved_dps = [r.dpcode for r in routes]
             unresolved_dps = [u.get("dpcode") for u in unresolved]
@@ -328,9 +375,9 @@ def pidspec_infer_batch_for_discovery(
 
             if matched_spec is not None:
                 routes, diagnostics = resolve_dp_routes(profile, matched_spec)
-                # diagnostics includes both successful ("ok") and failed entries;
-                # only count failures as unresolved.
-                unresolved = [d for d in diagnostics if d.get("status") != "ok"]
+                # Only unresolved REQUIRED DPs are a real failure; unresolved
+                # OPTIONAL DPs (device lacks that capability) are expected.
+                unresolved = _unresolved_required_dps(diagnostics, matched_spec)
                 if unresolved:
                     # PID matched but DP routes failed → low confidence
                     resolved_dps = [r.dpcode for r in routes]
@@ -453,9 +500,9 @@ async def async_infer_and_build_routes(
 
         # Resolve DP routes
         routes, diagnostics = resolve_dp_routes(profile, matched_spec)
-        # diagnostics includes both successful ("ok") and failed entries; only
-        # count failures as unresolved.
-        unresolved = [d for d in diagnostics if d.get("status") != "ok"]
+        # Only unresolved REQUIRED DPs are a real failure; unresolved OPTIONAL
+        # DPs (device lacks that capability) are expected — do not demote.
+        unresolved = _unresolved_required_dps(diagnostics, matched_spec)
 
         if unresolved:
             resolved_lines = [
@@ -617,9 +664,9 @@ def pidspec_resolve_bind(
 
     # Resolve DP routes
     routes, diagnostics = resolve_dp_routes(profile, matched_spec)
-    # diagnostics includes both successful ("ok") and failed entries; only
-    # count failures as unresolved.
-    unresolved = [d for d in diagnostics if d.get("status") != "ok"]
+    # Only unresolved REQUIRED DPs are a real failure; unresolved OPTIONAL DPs
+    # (device lacks that capability) are expected — do not reject the bind.
+    unresolved = _unresolved_required_dps(diagnostics, matched_spec)
 
     if unresolved:
         LOGGER.info(
@@ -714,11 +761,12 @@ def pidspec_build_full_device_properties(
     Return contract:
     - ``None``  → no route table for this device; caller should fall back to the
       legacy single-entity path.
-    - ``{}``    → route table exists but the device is NOT fully reportable right
-      now (some bound entity is unavailable/unknown). Availability is a
-      DEVICE-level concern handled separately via subdevice_login/logout, so we
-      never emit a *partial* full-state report that could clear sibling DPs —
-      the caller skips this round and a later change / periodic report catches up.
+    - ``{}``    → route table exists but a REQUIRED DP's entity is unavailable/
+      unknown, so the device's core state can't be represented; the caller skips
+      this round and a later change / periodic report catches up. (An OPTIONAL
+      DP's entity being unknown does NOT defer — that DP is emitted as a type
+      default so the report stays a COMPLETE state, which Tuya requires since the
+      cloud never merges partial reports. b2 behaviour.)
     - non-empty dict → the complete PID payload.
     """
     route_table = get_route_table(hass, tuya_device_id)
@@ -733,22 +781,46 @@ def _build_full_properties_from_route_table(
     context: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Build the complete PID payload from a (stored or freshly-built) route
-    table. Returns {} when the device is not fully reportable right now."""
+    table. Returns {} only when a REQUIRED DP's entity is unavailable/unknown
+    (b2); unknown OPTIONAL-DP entities are emitted as type defaults rather than
+    deferring the whole report, so the payload stays a complete Tuya state."""
     properties: dict[str, dict[str, Any]] = {}
+    required_dpcodes = route_table.required_dpcodes
     for entity_id in sorted(route_table.entity_ids):
         state = hass.states.get(entity_id)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            # A bound DP's entity is not currently reportable. A full-state PID
-            # report only makes sense when the WHOLE device is reportable, so
-            # defer rather than send a partial payload.
+            # b2: defer the WHOLE report only when a REQUIRED DP's entity is
+            # unreportable — without its core DPs the device state is
+            # meaningless. An OPTIONAL DP's entity being unknown must NOT block
+            # the report; otherwise one stuck secondary sensor freezes the whole
+            # panel. Tuya needs a COMPLETE state every time (the cloud never
+            # merges partial reports), so the unknown optional DP is still
+            # emitted — as a type default — by the fill loop below.
+            #
+            # Conservative fallback: an empty required_dpcodes (e.g. a route
+            # table built before this field existed) is treated as "everything
+            # required" → legacy defer-on-any-unknown.
+            carries_required = not required_dpcodes or any(
+                r.dpcode in required_dpcodes
+                for r in route_table.entity_to_routes.get(entity_id, [])
+            )
+            if carries_required:
+                LOGGER.debug(
+                    "full report deferred for tuya_device_id=%s: required entity "
+                    "%s not reportable (state=%s)",
+                    route_table.tuya_device_id,
+                    entity_id,
+                    None if state is None else state.state,
+                )
+                return {}
             LOGGER.debug(
-                "full report deferred for tuya_device_id=%s: entity %s not "
-                "reportable (state=%s)",
+                "tuya_device_id=%s: optional entity %s not reportable (state=%s); "
+                "emitting its DP(s) as default instead of deferring",
                 route_table.tuya_device_id,
                 entity_id,
                 None if state is None else state.state,
             )
-            return {}
+            continue
         ha_state = {"state": state.state}
         ha_attributes = dict(state.attributes)
         properties.update(
@@ -862,14 +934,24 @@ def _resolve_dp_properties(
     if vmax is not None and cmax is not None:
         vmax = min(vmax, cmax)
 
-    if vmin is not None:
-        dp_props["min"] = vmin
-    if vmax is not None:
-        dp_props["max"] = vmax
-    if step is not None:
-        dp_props["step"] = step
-    if cfg.get("unit") is not None:
-        dp_props["unit"] = cfg["unit"]
+        # 与 value 同域:范围也乘 DP scale(value 27.0→270 ⇒ min 17.0→170)。
+        # 读同一个 converter_config["scale"](std:numeric_scale / group:climate_temp)。
+        # 放在 tuya_contract clamp 之后(clamp 在真实度数域比较)。enum range 不动。
+        try:
+            scale = float(cfg.get("scale", 1))
+            if scale <= 0:
+                scale = 1.0
+        except (TypeError, ValueError):
+            scale = 1.0
+
+        if vmin is not None:
+            dp_props["min"] = int(round(vmin * scale)) if scale != 1 else vmin
+        if vmax is not None:
+            dp_props["max"] = int(round(vmax * scale)) if scale != 1 else vmax
+        if step is not None:
+            dp_props["step"] = int(round(step * scale)) if scale != 1 else step
+        if cfg.get("unit") is not None:
+                dp_props["unit"] = cfg["unit"]
 
     return dp_props or None
 
@@ -934,10 +1016,12 @@ def pidspec_build_default_properties(
 def _default_value_for_route(route: DPRoute) -> Any:
     """Hard default for a DP whose live value can't be resolved at bind time.
 
-    numeric → 0, bool → False, enum/string → "". JSON-structured DPs (e.g.
-    colour_data HSV) must keep a valid JSON structure — an empty string would
-    break the cloud's thing-model parse — so they fall back to a zero-valued
-    structure derived from the converter schema / explicit default.
+    numeric → 0, bool → False, string → "". Enum DPs default to a VALID range
+    member (explicit ``default`` / first ``value_map`` key), never "" — Tuya
+    rejects an out-of-range enum value. JSON-structured DPs (e.g. colour_data
+    HSV) must keep a valid JSON structure — an empty string would break the
+    cloud's thing-model parse — so they fall back to a zero-valued structure
+    derived from the converter schema / explicit default.
     """
     dp_type = route.dp_type
     if dp_type in ("value", "int", "integer"):
@@ -963,7 +1047,20 @@ def _default_value_for_route(route: DPRoute) -> Any:
         # colour_data-style HSV fallback
         return json.dumps({"h": 0, "s": 0, "v": 0}, separators=(",", ":"))
 
-    # enum / string / anything else → empty
+    # Enum DPs must default to a VALID member of their declared range — Tuya
+    # rejects an out-of-range enum value (e.g. ""). The value_map keys ARE the
+    # Tuya enum values ("device value == cloud value"), so use an explicit
+    # ``default`` if set, else the first declared key.
+    if dp_type == "enum":
+        enum_default = cfg.get("default")
+        if enum_default is not None:
+            return enum_default
+        value_map = cfg.get("value_map")
+        if isinstance(value_map, dict) and value_map:
+            return next(iter(value_map))
+        return ""
+
+    # string / anything else → empty
     return ""
 
 
