@@ -6,6 +6,7 @@
   ],
   "config_flow": true,
   "documentation": "https://github.com/tiankuosun/tuya_cloud_ha_bridge",
+  "issue_tracker": "https://github.com/tiankuosun/tuya_cloud_ha_bridge/issues",
   "integration_type": "hub",
   "iot_class": "cloud_push",
   "quality_scale": "bronze",
