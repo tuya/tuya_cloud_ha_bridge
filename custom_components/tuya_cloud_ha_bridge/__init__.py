@@ -1210,6 +1210,10 @@ async def _async_remove_subdevice_bindings(
             ):
                 runtime_data.unsubscribe_child_device_messages(child_device_id)
 
+            from .pidspec_bridge import remove_route_table
+
+            remove_route_table(hass, child_device_id)
+
             if stale_device := device_registry.async_get(matched_device_id):
                 device_registry.async_update_device(
                     stale_device.id,
@@ -1301,6 +1305,12 @@ async def _async_remove_local_bindings_by_device_id(
                 and tuya_device_id
             ):
                 runtime_data.unsubscribe_child_device_messages(tuya_device_id)
+
+            _stale_tid = device_data.get("tuya_device_id")
+            if isinstance(_stale_tid, str) and _stale_tid:
+                from .pidspec_bridge import remove_route_table
+
+                remove_route_table(hass, _stale_tid)
 
             if stale_device := device_registry.async_get(ha_device_id):
                 device_registry.async_update_device(
@@ -1756,6 +1766,10 @@ async def async_handle_topo_get_response(
                         runtime_data.unsubscribe_child_device_messages(
                             previous_tuya_device_id
                         )
+                    if isinstance(previous_tuya_device_id, str) and previous_tuya_device_id:
+                        from .pidspec_bridge import remove_route_table
+
+                        remove_route_table(hass, previous_tuya_device_id)
                     existing["tuya_device_id"] = tuya_device_id
                     binding_changed = True
 
@@ -3234,6 +3248,10 @@ async def async_remove_config_entry_device(
             ):
                 runtime_data.unsubscribe_child_device_messages(tuya_device_id)
 
+            from .pidspec_bridge import remove_route_table
+
+            remove_route_table(hass, tuya_device_id)
+
     if device_entry.id not in set(deleted_device_ids):
         deleted_device_ids.append(device_entry.id)
 
@@ -3256,6 +3274,22 @@ async def async_unload_entry(
     """Unload a config entry and disconnect MQTT."""
     _get_topo_sync_sessions(hass).pop(entry.entry_id, None)
     _get_pending_bind_clients(hass).pop(entry.entry_id, None)
+    # Module-level global (survives unload/reload, only cleared on process
+    # restart). Drop this entry's fingerprints so inference gating re-evaluates
+    # cleanly after a reinstall instead of reusing pre-uninstall state.
+    _DEVICE_FINGERPRINTS.pop(entry.entry_id, None)
+
+    # Route tables live in hass.data[DOMAIN] keyed by tuya_device_id and are NOT
+    # scoped by entry_id, so they survive unload/reload within a live process.
+    # Drop this entry's route tables so a reinstall starts clean — a full HA
+    # restart clears hass.data, which is why restart "fixes" stale-binding bugs.
+    from .pidspec_bridge import remove_route_table
+
+    _unload_bindings = await async_load_gateway_bindings(hass, entry.entry_id) or {}
+    for _dev in _unload_bindings.get("devices", {}).values():
+        _tid = _dev.get("tuya_device_id")
+        if isinstance(_tid, str) and _tid:
+            remove_route_table(hass, _tid)
 
     prefix = f"{entry.entry_id}:"
     for key in [k for k in _pending_device_reports if k.startswith(prefix)]:
