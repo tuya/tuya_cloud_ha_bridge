@@ -59,14 +59,22 @@ DIAGNOSTIC_DEVICE_CLASS_WHITELIST: frozenset[str] = frozenset(
     }
 )
 
-# Domains with no Tuya DP mapping — always excluded.
+# Domains with no Tuya DP mapping — always excluded from the profile entirely.
 CONDITIONAL_DOMAINS: frozenset[str] = frozenset(
     {
         "event",                    # 一次性事件触发（无持久状态）
-        "button",                   # 动作按钮（restart、identify 等）
-        "notify",                   # 通知
+        "notify",                   # 通知（send-only）
     }
 )
+
+# Domains INCLUDED in the profile (so a matched spec's DPs CAN route to them)
+# but EXCLUDED from inference — they never enter domain_set nor the feature /
+# carrier checks, so they cannot influence which PID matches or the score.
+# Purpose: momentary actions like a projector's play/pause `button` entities.
+# Routing (dp_routing) still binds them; only inference.py ignores them.
+# NOTE: config/diagnostic buttons (restart, identify) are still dropped earlier
+# by the entity_category filter, so only primary action buttons survive.
+INFERENCE_EXCLUDED_DOMAINS: frozenset[str] = frozenset({"button"})
 
 
 def should_include_entity(

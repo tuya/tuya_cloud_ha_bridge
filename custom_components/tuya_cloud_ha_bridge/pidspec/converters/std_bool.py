@@ -33,6 +33,12 @@ class StdBoolSwitch:
         service_off = config.get("service_off", "turn_off")
 
         service = service_on if value else service_off
+        # Empty service → no-op. Lets a momentary/action DP (e.g. a projector's
+        # play button mapped from a bool DP with service_on="press",
+        # service_off="") press on True and do NOTHING on False, instead of
+        # calling a non-existent turn_off on a button entity.
+        if not service:
+            return None
         service_data: dict[str, Any] = {"entity_id": entity_id}
 
         extra = config.get("service_data")

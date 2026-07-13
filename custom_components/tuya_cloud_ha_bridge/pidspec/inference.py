@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..const import LOGGER
+from .entity_filter import INFERENCE_EXCLUDED_DOMAINS
 from .models import (
     DeviceProfile,
     DPDefinition,
@@ -29,6 +30,30 @@ MARGIN_THRESHOLD = 8
 # "curtain" device) is a strong signal the spec is a poor fit.
 EXTRA_DOMAIN_TRIGGER = 2
 EXTRA_DOMAIN_PENALTY_PER_EXTRA = 4
+
+# Whole-device "identity" domains: a device exposing one of these IS that kind
+# of device (rarely incidental). If the matched spec neither requires, lists as
+# optional, nor ignores such a domain, the spec is describing something else —
+# demote to low-confidence. Generic building-block domains (switch / sensor /
+# binary_sensor / select / number / button / event / light / fan) are excluded:
+# they compose freely and are already well covered by specs / disambiguate.
+CORE_IDENTITY_DOMAINS = frozenset(
+    {
+        "climate",
+        "water_heater",
+        "humidifier",
+        "vacuum",
+        "lawn_mower",
+        "cover",
+        "media_player",
+        "camera",
+        "lock",
+        "alarm_control_panel",
+        "siren",
+        "valve",
+        "remote",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +142,43 @@ def infer_pid(device_profile: DeviceProfile, all_specs: list[PidSpec]) -> PidInf
         scored.append((spec, spec_score))
         scoring_breakdown[spec.product_id] = breakdown
     scored.sort(key=lambda t: t[1], reverse=True)
+
+    # 3b. Gate-based candidate pruning — applied BEFORE margin/threshold so a
+    # look-alike spec cannot (a) win as a spurious top match nor (b) trigger a
+    # false margin_tight against the correct spec. A candidate is pruned when it
+    # exposes an unhandled core-identity domain, OR it is identity-gateable yet
+    # the device shows no positive identity for it. (Example: a projector's
+    # switch+select structurally passes the range-hood spec and can even
+    # out-score the real projector spec; pruning removes the hood here.)
+    def _is_gated(spec: PidSpec) -> bool:
+        if _unhandled_core_domains(device_profile, spec):
+            return True
+        return _spec_is_identity_gateable(spec) and not _has_positive_identity(
+            device_profile, spec
+        )
+
+    ungated = [(spec, sc) for spec, sc in scored if not _is_gated(spec)]
+    if not ungated:
+        gate_top = scored[0][0]
+        core = _unhandled_core_domains(device_profile, gate_top)
+        reason = "unhandled_core_domain" if core else "no_positive_identity"
+        signal = (
+            "unhandled_core_domain:" + ",".join(sorted(core)) if core
+            else "no_positive_identity"
+        )
+        LOGGER.info(
+            "infer_pid: device=%s → all candidates gated (%s)", device_name, reason,
+        )
+        return PidInferResult(
+            status="needs_cloud_upgrade",
+            reason=reason,
+            candidates=scored,
+            low_confidence_signal=signal,
+            hard_filter_passed=hard_filter_passed,
+            hard_filter_rejected=hard_filter_rejected,
+            scoring_breakdown=scoring_breakdown,
+        )
+    scored = ungated
 
     top_spec, top_score = scored[0]
 
@@ -223,6 +285,69 @@ def infer_pid(device_profile: DeviceProfile, all_specs: list[PidSpec]) -> PidInf
             match_details=match_details,
         )
 
+    # 4b'''. Core-identity-domain gate. If the device exposes a whole-device
+    # identity domain (media_player / camera / lock / climate / vacuum / …) that
+    # the matched spec does not handle (required + optional, minus ignore), the
+    # spec is describing a different kind of device — demote. Catches unknown
+    # categories with no spec (e.g. a media_player slipping into an appliance
+    # spec) and generic specs stealing a core-domain device (e.g. a climate unit
+    # with temp/humidity sensors matching a bare temp/humidity meter spec).
+    unhandled_core = _unhandled_core_domains(device_profile, top_spec)
+    if unhandled_core:
+        LOGGER.info(
+            "infer_pid: device=%s → unhandled_core_domain top=%s domains=%s",
+            device_name, top_spec.product_id, sorted(unhandled_core),
+        )
+        scoring_breakdown.setdefault(top_spec.product_id, {}).setdefault(
+            "deductions", []
+        ).append(
+            {"reason": "unhandled_core_domain", "domains": sorted(unhandled_core)}
+        )
+        return PidInferResult(
+            status="needs_cloud_upgrade",
+            reason="unhandled_core_domain",
+            candidates=scored,
+            low_confidence_signal=(
+                "unhandled_core_domain:" + ",".join(sorted(unhandled_core))
+            ),
+            margin=margin,
+            hard_filter_passed=hard_filter_passed,
+            hard_filter_rejected=hard_filter_rejected,
+            scoring_breakdown=scoring_breakdown,
+            match_details=match_details,
+        )
+
+    # 4b''. Positive-identity evidence gate. A specific named-control appliance
+    # spec (declares name_keywords AND has a required DP with match_hints) that
+    # matched here on STRUCTURE alone — right domains + optional-DP coverage —
+    # is rejected when the device shows NO positive identity signal: no name/
+    # model keyword hit, no declared positive_attr, and no required-DP carrier
+    # matched by its keyword. That is the look-alike signature (e.g. a projector
+    # with switch(mute)+select(input) slipping into a range-hood spec whose
+    # '档位' speed keyword matches nothing). Pure-sensor specs are exempt.
+    if _spec_is_identity_gateable(top_spec) and not _has_positive_identity(
+        device_profile, top_spec
+    ):
+        LOGGER.info(
+            "infer_pid: device=%s → no_positive_identity top=%s "
+            "(structural-only match with unhandled extra domains)",
+            device_name, top_spec.product_id,
+        )
+        scoring_breakdown.setdefault(top_spec.product_id, {}).setdefault(
+            "deductions", []
+        ).append({"reason": "no_positive_identity"})
+        return PidInferResult(
+            status="needs_cloud_upgrade",
+            reason="no_positive_identity",
+            candidates=scored,
+            low_confidence_signal="no_positive_identity",
+            margin=margin,
+            hard_filter_passed=hard_filter_passed,
+            hard_filter_rejected=hard_filter_rejected,
+            scoring_breakdown=scoring_breakdown,
+            match_details=match_details,
+        )
+
     # 4c. Confident match
     LOGGER.info(
         "infer_pid: device=%s → matched %s",
@@ -251,7 +376,79 @@ def _device_has_any_feature(
     """Return True if at least one entity in *domain* exposes any of *features*."""
     feature_set = set(features)
     for entity in device_profile.entity_profiles:
+        if entity.domain in INFERENCE_EXCLUDED_DOMAINS:
+            continue
         if entity.domain == domain and (entity.supported_features & feature_set):
+            return True
+    return False
+
+
+def _has_positive_identity(device_profile: DeviceProfile, spec: PidSpec) -> bool:
+    """True if the device shows a positive identity signal for *spec*: a
+    name/model keyword hit, a declared positive_attr present on some entity, or
+    a REQUIRED-DP carrier whose name matches that DP's match_hints keyword
+    (strong evidence the device really carries that DP's function)."""
+    dis = spec.disambiguate
+    name_keywords = (getattr(dis, "name_keywords", None) or []) if dis else []
+    if name_keywords:
+        blob = f"{device_profile.name} {device_profile.model}".lower()
+        if any(kw and kw.lower() in blob for kw in name_keywords):
+            return True
+    positive_attrs = set((getattr(dis, "positive_attrs", None) or []) if dis else [])
+    if positive_attrs:
+        for entity in device_profile.entity_profiles:
+            if positive_attrs & set(entity.attributes.keys()):
+                return True
+    return _required_dp_keyword_hit(device_profile, spec)
+
+
+def _required_dp_keyword_hit(device_profile: DeviceProfile, spec: PidSpec) -> bool:
+    """True if any REQUIRED DP that declares match_hints has a same-domain
+    entity whose id/name contains one of its preferred keywords — e.g. a real
+    range hood's '档位' speed select matches speed_settings' keyword."""
+    for dpcode in spec.required_dps:
+        dp_def = _find_dp_definition(spec, dpcode)
+        if dp_def is None or dp_def.match_hints is None:
+            continue
+        preferred = [
+            k.lower() for k in (dp_def.match_hints.preferred_keywords or []) if k
+        ]
+        if not preferred:
+            continue
+        target_domains = {t.domain for t in dp_def.candidate_targets}
+        for entity in device_profile.entity_profiles:
+            if entity.domain not in target_domains:
+                continue
+            blob = (
+                f"{entity.entity_id} {entity.friendly_name} {entity.original_name}"
+            ).lower()
+            if any(kw in blob for kw in preferred):
+                return True
+    return False
+
+
+def _unhandled_core_domains(device_profile: DeviceProfile, spec: PidSpec) -> set[str]:
+    """Return the device's core-identity domains (CORE_IDENTITY_DOMAINS) that
+    *spec* neither requires, lists as optional, nor ignores. Non-empty means the
+    spec describes a different kind of device than what the device fundamentally
+    is (e.g. a climate/lock/media_player domain the spec does not handle)."""
+    handled = spec.required_domains | spec.optional_domains
+    effective = device_profile.domain_set - spec.ignore_domains
+    return (effective & CORE_IDENTITY_DOMAINS) - handled
+
+
+def _spec_is_identity_gateable(spec: PidSpec) -> bool:
+    """True if *spec* is a specific named-control appliance eligible for the
+    positive-identity gate: it declares identity name_keywords AND has at least
+    one required DP with match_hints. Pure-sensor / structural specs (identified
+    by device_class, no keyword'd required control — e.g. temp/humidity, door
+    sensor) are exempt so they are never false-downgraded."""
+    dis = spec.disambiguate
+    if dis is None or not (getattr(dis, "name_keywords", None) or []):
+        return False
+    for dpcode in spec.required_dps:
+        dp_def = _find_dp_definition(spec, dpcode)
+        if dp_def is not None and dp_def.match_hints is not None:
             return True
     return False
 
@@ -287,6 +484,11 @@ def _list_carrier_entities(
     for target in dp_def.candidate_targets:
         required_features = set(target.features)
         for entity in device_profile.entity_profiles:
+            # Inference-excluded domains (button) are never carriers for the
+            # inference-side checks (required-DP assignment / optional-DP
+            # scoring); routing binds them separately via dp_routing.
+            if entity.domain in INFERENCE_EXCLUDED_DOMAINS:
+                continue
             # Domain must match
             if entity.domain != target.domain:
                 continue

@@ -244,6 +244,18 @@ class ClimateTempGroupConverter:
         # Only setpoint roles control HA; current/unit DPs are read-only and
         # never reach here (dispatcher drops read-only routes inbound). Each DP
         # is de-scaled from the Tuya integer into real degrees before use.
+        # Native value+unit role: the setpoint DP carries the value in the
+        # HA-native unit already — de-scale and use directly, NO conversion.
+        dp_native = role_to_dp.get("temp_setpoint")
+        raw_native = group_payload.get(dp_native) if dp_native else None
+        if raw_native is not None:
+            temp_value = float(raw_native) / role_to_scale["temp_setpoint"]
+            return [{
+                "domain": domain,
+                "service": "set_temperature",
+                "service_data": {"entity_id": entity_id, "temperature": temp_value},
+            }]
+
         dp_c = role_to_dp.get("temp_celsius")
         dp_f = role_to_dp.get("temp_fahrenheit")
         raw_c = group_payload.get(dp_c) if dp_c else None
@@ -308,6 +320,24 @@ class ClimateTempGroupConverter:
         # both °C and °F DPs when those DPs exist.
         _emit("temperature", "temp_celsius", "temp_fahrenheit")
         _emit("current_temperature", "current_celsius", "current_fahrenheit")
+
+        # Native (unit-agnostic) roles for the single-value + unit_report scheme:
+        # report the HA value AS-IS in its own unit — NO °F↔°C conversion —
+        # paired with unit_report so Tuya reads it via the reported unit. Keeps
+        # value, unit and declared range all in the device's native unit.
+        def _emit_native(attr: str, role: str) -> None:
+            raw = ha_attributes.get(attr)
+            if raw is None:
+                return
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return
+            if dpcode := role_to_dp.get(role):
+                result[dpcode] = int(round(value * role_to_scale[role]))
+
+        _emit_native("temperature", "temp_setpoint")
+        _emit_native("current_temperature", "current_temp")
 
         # Report-only: tell Tuya which unit the HA device uses.
         if dpcode := role_to_dp.get("unit_report"):

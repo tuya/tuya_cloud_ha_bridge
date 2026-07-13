@@ -16,7 +16,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
-from .pidspec.entity_filter import should_include_entity
+from .pidspec.entity_filter import INFERENCE_EXCLUDED_DOMAINS, should_include_entity
 from .pidspec.features import discover_features
 from .pidspec.components import discover_component
 from .pidspec.models import (
@@ -198,7 +198,11 @@ def async_build_device_profile(
             hass, entry, rule_cache.feature_rules, local_component_rules
         )
         entity_profiles.append(profile)
-        domains.add(entry.domain)
+        # Inference-excluded domains (e.g. button) are kept in the profile so a
+        # matched spec's DPs can still route to them, but MUST stay out of
+        # domain_set so they never influence PID inference / scoring.
+        if entry.domain not in INFERENCE_EXCLUDED_DOMAINS:
+            domains.add(entry.domain)
 
     if not entity_profiles:
         return None
