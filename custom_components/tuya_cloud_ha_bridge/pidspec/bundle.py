@@ -218,6 +218,7 @@ def _parse_disambiguate(raw: dict[str, Any]) -> DisambiguateHints | None:
         positive_attrs=set(raw.get("positive_attrs") or []),
         negative_attrs=set(raw.get("negative_attrs") or []),
         weight=float(raw.get("weight", 0.0)),
+        required_device_classes=set(raw.get("required_device_classes") or []),
     )
 
 
@@ -476,12 +477,15 @@ def _serialise_dp_definition(
 
 
 def _serialise_disambiguate(d: DisambiguateHints) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "name_keywords": list(d.name_keywords),
         "positive_attrs": sorted(d.positive_attrs),
         "negative_attrs": sorted(d.negative_attrs),
         "weight": d.weight,
     }
+    if d.required_device_classes:
+        out["required_device_classes"] = sorted(d.required_device_classes)
+    return out
 
 
 def serialise_pidspec(spec: PidSpec) -> dict[str, Any]:

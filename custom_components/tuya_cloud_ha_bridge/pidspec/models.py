@@ -86,6 +86,12 @@ class DisambiguateHints:
     positive_attrs: set[str]
     negative_attrs: set[str]
     weight: float = 0.0
+    # Device classes that count as positive identity evidence — any entity
+    # whose device_class hits this set satisfies the S1 gate. Lets pure-sensor
+    # specs (door magnet, temp/humidity meter) be identity-gated without
+    # requiring match_hints on their required DPs; the identity signal comes
+    # from HA's device_class taxonomy (door/opening/temperature/humidity/…).
+    required_device_classes: set[str] = field(default_factory=set)
 
 
 @dataclass

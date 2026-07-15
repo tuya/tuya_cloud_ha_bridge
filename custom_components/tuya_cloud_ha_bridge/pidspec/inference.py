@@ -55,6 +55,23 @@ CORE_IDENTITY_DOMAINS = frozenset(
     }
 )
 
+# Domains that ARE a device identity by themselves. When a spec's
+# required_domains are non-empty and ALL semantic, the required-domain hard
+# filter already establishes positive identity: HA declaring a `vacuum` /
+# `climate` / `light` entity IS the integration asserting what the device is.
+# Generic CARRIER domains (sensor / binary_sensor / select / number / button /
+# switch-as-sub-control…) carry no identity — a door magnet and a 3D-printer
+# spool sensor are both just `binary_sensor`. Specs whose required domains
+# include any carrier domain must prove identity through other evidence
+# (name_keywords / positive_attrs / required_device_classes / DP keywords).
+# NOTE `switch` counts as semantic ONLY because a device whose required
+# structure is switch-alone IS functionally a switch/plug; but a spec that
+# requires switch PLUS a carrier domain (e.g. hood: switch+select) does NOT
+# get identity from it — the all-semantic rule below handles this correctly.
+SEMANTIC_IDENTITY_DOMAINS = CORE_IDENTITY_DOMAINS | frozenset(
+    {"fan", "light", "switch"}
+)
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -146,16 +163,15 @@ def infer_pid(device_profile: DeviceProfile, all_specs: list[PidSpec]) -> PidInf
     # 3b. Gate-based candidate pruning — applied BEFORE margin/threshold so a
     # look-alike spec cannot (a) win as a spurious top match nor (b) trigger a
     # false margin_tight against the correct spec. A candidate is pruned when it
-    # exposes an unhandled core-identity domain, OR it is identity-gateable yet
-    # the device shows no positive identity for it. (Example: a projector's
-    # switch+select structurally passes the range-hood spec and can even
-    # out-score the real projector spec; pruning removes the hood here.)
+    # exposes an unhandled core-identity domain, OR the device shows no
+    # positive identity for it. The identity requirement applies to EVERY spec
+    # — no exemption class (the old "pure-sensor specs exempt" carve-out is
+    # exactly how a 3D-printer spool got bound as a door magnet: structural
+    # consistency alone must never produce matched).
     def _is_gated(spec: PidSpec) -> bool:
         if _unhandled_core_domains(device_profile, spec):
             return True
-        return _spec_is_identity_gateable(spec) and not _has_positive_identity(
-            device_profile, spec
-        )
+        return not _has_positive_identity(device_profile, spec)
 
     ungated = [(spec, sc) for spec, sc in scored if not _is_gated(spec)]
     if not ungated:
@@ -317,17 +333,11 @@ def infer_pid(device_profile: DeviceProfile, all_specs: list[PidSpec]) -> PidInf
             match_details=match_details,
         )
 
-    # 4b''. Positive-identity evidence gate. A specific named-control appliance
-    # spec (declares name_keywords AND has a required DP with match_hints) that
-    # matched here on STRUCTURE alone — right domains + optional-DP coverage —
-    # is rejected when the device shows NO positive identity signal: no name/
-    # model keyword hit, no declared positive_attr, and no required-DP carrier
-    # matched by its keyword. That is the look-alike signature (e.g. a projector
-    # with switch(mute)+select(input) slipping into a range-hood spec whose
-    # '档位' speed keyword matches nothing). Pure-sensor specs are exempt.
-    if _spec_is_identity_gateable(top_spec) and not _has_positive_identity(
-        device_profile, top_spec
-    ):
+    # 4b''. Positive-identity evidence gate — defensive re-check of the 3b
+    # pruning invariant on the winning spec (belt and braces: any future code
+    # path that reaches here without 3b must still respect matched ⇒ identity).
+    # Applies to EVERY spec, no exemption class.
+    if not _has_positive_identity(device_profile, top_spec):
         LOGGER.info(
             "infer_pid: device=%s → no_positive_identity top=%s "
             "(structural-only match with unhandled extra domains)",
@@ -384,10 +394,28 @@ def _device_has_any_feature(
 
 
 def _has_positive_identity(device_profile: DeviceProfile, spec: PidSpec) -> bool:
-    """True if the device shows a positive identity signal for *spec*: a
-    name/model keyword hit, a declared positive_attr present on some entity, or
-    a REQUIRED-DP carrier whose name matches that DP's match_hints keyword
-    (strong evidence the device really carries that DP's function)."""
+    """True if the device shows a positive identity signal for *spec*.
+
+    INVARIANT (宁可推不出，不可推错): matched ⇒ positive identity. This check
+    applies to EVERY spec with no exemption class — structural consistency
+    (right domains, assignable DPs) is necessary but never sufficient. Five
+    evidence paths, any one passes:
+
+    1. Semantic required domains — required_domains non-empty and ALL in
+       SEMANTIC_IDENTITY_DOMAINS. The hard filter already verified their
+       presence, and a semantic domain IS an identity claim by the source
+       integration (`vacuum` entity ⇒ the device is a vacuum). A spec that
+       mixes in carrier domains (hood: switch+select) does NOT pass here.
+    2. name_keywords hit on device name/model.
+    3. A declared positive_attr present on some entity.
+    4. required_device_classes hit — some entity's device_class is in the
+       spec's declared set (e.g. door spec: binary_sensor with
+       device_class=door). Identity via HA's device_class taxonomy; this is
+       how pure-sensor specs prove identity without name luck.
+    5. A REQUIRED-DP carrier whose name matches that DP's match_hints keyword.
+    """
+    if spec.required_domains and spec.required_domains <= SEMANTIC_IDENTITY_DOMAINS:
+        return True
     dis = spec.disambiguate
     name_keywords = (getattr(dis, "name_keywords", None) or []) if dis else []
     if name_keywords:
@@ -398,6 +426,13 @@ def _has_positive_identity(device_profile: DeviceProfile, spec: PidSpec) -> bool
     if positive_attrs:
         for entity in device_profile.entity_profiles:
             if positive_attrs & set(entity.attributes.keys()):
+                return True
+    required_device_classes = (
+        set(getattr(dis, "required_device_classes", None) or []) if dis else set()
+    )
+    if required_device_classes:
+        for entity in device_profile.entity_profiles:
+            if entity.device_class and entity.device_class in required_device_classes:
                 return True
     return _required_dp_keyword_hit(device_profile, spec)
 
@@ -435,22 +470,6 @@ def _unhandled_core_domains(device_profile: DeviceProfile, spec: PidSpec) -> set
     handled = spec.required_domains | spec.optional_domains
     effective = device_profile.domain_set - spec.ignore_domains
     return (effective & CORE_IDENTITY_DOMAINS) - handled
-
-
-def _spec_is_identity_gateable(spec: PidSpec) -> bool:
-    """True if *spec* is a specific named-control appliance eligible for the
-    positive-identity gate: it declares identity name_keywords AND has at least
-    one required DP with match_hints. Pure-sensor / structural specs (identified
-    by device_class, no keyword'd required control — e.g. temp/humidity, door
-    sensor) are exempt so they are never false-downgraded."""
-    dis = spec.disambiguate
-    if dis is None or not (getattr(dis, "name_keywords", None) or []):
-        return False
-    for dpcode in spec.required_dps:
-        dp_def = _find_dp_definition(spec, dpcode)
-        if dp_def is not None and dp_def.match_hints is not None:
-            return True
-    return False
 
 
 def _has_any_carrier(device_profile: DeviceProfile, dp_def: DPDefinition) -> bool:

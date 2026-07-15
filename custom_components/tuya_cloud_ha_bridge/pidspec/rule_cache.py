@@ -138,6 +138,10 @@ def _parse_disambiguate(raw: dict[str, Any] | None):
         positive_attrs=set(raw.get("positive_attrs", [])),
         negative_attrs=set(raw.get("negative_attrs", [])),
         weight=float(raw.get("weight", 0.0)),
+        # NOTE: bundle.py carries a second copy of this parser — keep the
+        # accepted keys in sync (they have already drifted once, silently
+        # dropping required_device_classes and breaking the identity gate).
+        required_device_classes=set(raw.get("required_device_classes", [])),
     )
 
 
