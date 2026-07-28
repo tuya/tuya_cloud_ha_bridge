@@ -45,6 +45,11 @@ _DEFAULT_SUB_DEVICE_LIMIT = 30
 # few extra (margin) to leave slack for ones that still fail to bind — but cap
 # the total for performance instead of uploading an unbounded list.
 _REPORT_OVER_LIMIT_MARGIN = 10
+# Page size for the low-confidence report. The capped device list is split into
+# pages of at most this many devices, each sent as an independent POST. Keeps a
+# single request small while the cloud-driven total cap (sub_device_limit +
+# margin) still bounds how many devices are uploaded overall.
+_REPORT_PAGE_SIZE = 10
 
 _REQUEST_TIMEOUT = 15
 
@@ -186,17 +191,22 @@ class TuyaCloudRuleClient:
               "devices": [ DeviceItem, ... ]
             }
 
-        ``request_id`` is generated per call so retries of the *same* logical
-        report can be deduplicated cloud-side (the caller may reuse a client but
-        each invocation is a fresh report). The response is an ACK
+        The device list is first capped to the cloud-driven total
+        (``sub_device_limit + margin``), then split into pages of at most
+        ``_REPORT_PAGE_SIZE`` devices. Each page is POSTed as an independent
+        report with its own freshly generated ``request_id`` — the cloud does
+        not aggregate across requests, so a page is a self-contained report and
+        retries of the *same* page can be deduplicated cloud-side. Pages are
+        sent sequentially and best-effort: a failed page is logged and the
+        remaining pages are still attempted. Each response is an ACK
         (``FusionResult<Boolean>``); we do not block on analysis results.
         """
         if not devices:
             return
 
-        # Cap the batch to sub_device_limit + margin. Reported devices are
-        # binding candidates; only `sub_device_limit` can ultimately bind, so a
-        # small margin is kept while the total is bounded for performance.
+        # Cap the total to sub_device_limit + margin (cloud-driven). Reported
+        # devices are binding candidates; only `sub_device_limit` can ultimately
+        # bind, so a small margin is kept while the total is bounded.
         cap = self.max_report_devices
         if len(devices) > cap:
             LOGGER.info(
@@ -219,6 +229,47 @@ class TuyaCloudRuleClient:
         url = f"{self._base_url}{_REPORT_LOW_CONFIDENCE_PATH}"
         session = async_get_clientsession(self._hass)
 
+        # Paginate the capped list into pages of at most _REPORT_PAGE_SIZE.
+        total = len(devices)
+        page_count = (total + _REPORT_PAGE_SIZE - 1) // _REPORT_PAGE_SIZE
+        LOGGER.debug(
+            "cloud_rules: reporting %d low-confidence device(s) in %d page(s) "
+            "of up to %d (gateway_id=%s)",
+            total,
+            page_count,
+            _REPORT_PAGE_SIZE,
+            self._gateway_id,
+        )
+        for page_index in range(page_count):
+            start = page_index * _REPORT_PAGE_SIZE
+            page_devices = devices[start : start + _REPORT_PAGE_SIZE]
+            await self._async_post_report_page(
+                session,
+                url,
+                page_devices,
+                local_rule_version=local_rule_version,
+                trigger=trigger,
+                page_index=page_index,
+                page_count=page_count,
+            )
+
+    async def _async_post_report_page(
+        self,
+        session: Any,
+        url: str,
+        devices: list[dict[str, Any]],
+        *,
+        local_rule_version: int,
+        trigger: str,
+        page_index: int,
+        page_count: int,
+    ) -> None:
+        """POST a single page of the low-confidence report (best-effort).
+
+        Each page carries its own ``request_id`` and is a standalone report.
+        Network/HTTP errors and non-success ACKs are logged (with the page
+        position) and swallowed so the remaining pages are still attempted.
+        """
         request: dict[str, Any] = {
             "request_id": uuid.uuid4().hex,
             "gateway_id": self._gateway_id or "",
@@ -230,20 +281,36 @@ class TuyaCloudRuleClient:
         payload = {"requestBody": json.dumps(request, ensure_ascii=False, default=str)}
 
         LOGGER.debug(
-            "cloud_rules: reporting low-confidence gateway_id: %s\n%s",
+            "cloud_rules: reporting low-confidence page %d/%d (%d devices) "
+            "gateway_id: %s\n%s",
+            page_index + 1,
+            page_count,
+            len(devices),
             self._gateway_id,
             json.dumps(request, indent=2, ensure_ascii=False, default=str),
         )
 
-        resp = await session.post(
-            url, headers=self._headers(), json=payload, timeout=_REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-        body: dict[str, Any] = await resp.json()
+        try:
+            resp = await session.post(
+                url, headers=self._headers(), json=payload, timeout=_REQUEST_TIMEOUT
+            )
+            resp.raise_for_status()
+            body: dict[str, Any] = await resp.json()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "cloud_rules: low-confidence report page %d/%d failed: %s",
+                page_index + 1,
+                page_count,
+                exc,
+            )
+            return
 
         if not body.get("success"):
             LOGGER.warning(
-                "cloud_rules: low-confidence report failed: errorCode=%s errorMsg=%s",
+                "cloud_rules: low-confidence report page %d/%d failed: "
+                "errorCode=%s errorMsg=%s",
+                page_index + 1,
+                page_count,
                 body.get("errorCode"),
                 body.get("errorMsg"),
             )
