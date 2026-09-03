@@ -5,6 +5,43 @@ from __future__ import annotations
 from .models import EntityProfile, FeatureRules
 
 
+def _condition_holds(condition: dict, value: object) -> bool:
+    """Evaluate a domain_attr_features condition against the attribute value.
+
+    Supported condition types:
+
+    - ``bitfield_contains`` {"bit": N} — the int attribute has that bit set.
+    - ``list_contains_any`` {"values": [...]} — the list attribute contains at
+      least one of the listed values.
+
+    ``list_contains_any`` exists because *key presence is not always evidence of
+    capability*: HA's light platform publishes ``hs_color``/``rgb_color``/
+    ``xy_color`` as None even on a colour-temperature-only lamp (verified across
+    every light in the profile store), so a rule keyed on the attribute NAME
+    grants a `color` feature the lamp does not have. The capability list
+    (``supported_color_modes``) must be read by VALUE instead.
+
+    An unknown condition type fails closed — the feature is not granted — so a
+    rule naming a condition this engine does not implement cannot silently widen
+    matching.
+    """
+    cond_type = condition.get("type")
+    if cond_type == "bitfield_contains":
+        bit = condition.get("bit")
+        if bit is None:
+            return True
+        try:
+            return bool(int(value or 0) & int(bit))
+        except (TypeError, ValueError):
+            return False
+    if cond_type == "list_contains_any":
+        wanted = condition.get("values") or []
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return False
+        return any(v in value for v in wanted)
+    return False
+
+
 def discover_features(entity: EntityProfile, rules: FeatureRules) -> set[str]:
     """Derive the feature set for an entity by applying rules in priority order.
 
@@ -45,13 +82,10 @@ def discover_features(entity: EntityProfile, rules: FeatureRules) -> set[str]:
                     continue
                 if attr_key not in entity.attributes:
                     continue
-                if condition is not None:
-                    cond_type = condition.get("type")
-                    if cond_type == "bitfield_contains":
-                        bit = condition.get("bit")
-                        value = entity.attributes.get(attr_key, 0)
-                        if bit is not None and not (int(value) & int(bit)):
-                            continue
+                if condition is not None and not _condition_holds(
+                    condition, entity.attributes.get(attr_key)
+                ):
+                    continue
                 features.add(feature)
 
     # Steps 5-6 are fallback-only — skip when 1-4 produced features

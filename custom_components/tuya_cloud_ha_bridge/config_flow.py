@@ -38,7 +38,7 @@ from .const import (
 from .region_mapping import get_region_endpoints_for_api_key, is_api_key_region_supported
 from .storage import async_load_gateway_credentials
 from .tuya_link_mqtt import TuyaLinkMqttClient
-from .tuya_openapi import TuyaOpenApiError, async_create_ha_gateway, async_get_sub_device_limit
+from .tuya_openapi import TuyaOpenApiError, async_create_ha_gateway
 
 DEFAULT_ENTRY_TITLE = "Tuya_New_HA"
 
@@ -94,7 +94,6 @@ def _gateway_placeholders(gateway_data: dict[str, Any]) -> dict[str, str]:
         "guide_url": TUYA_CLOUD_API_KEY_GUIDE_URL,
         CONF_DEVICE_ID: str(gateway_data.get(CONF_DEVICE_ID, "")),
         "device_name": str(gateway_data.get(CONF_DEVICE_NAME, "")),
-        "sub_device_limit": str(gateway_data.get("sub_device_limit", "")),
     }
 
 
@@ -178,14 +177,6 @@ class _TemporaryGatewayClientMixin:
             LOGGER.exception("Unexpected error calling Tuya OpenAPI")
             return None, "cannot_create_gateway"
 
-        # Fetch sub-device limit (best-effort, do not block gateway creation).
-        sub_device_limit = ""
-        try:
-            limit_count = await async_get_sub_device_limit(self.hass, api_key)
-            sub_device_limit = str(limit_count)
-        except Exception:
-            LOGGER.debug("Failed to fetch sub-device limit, skipping")
-
         gateway_data: dict[str, str] = {
             CONF_API_KEY: api_key,
             CONF_PRODUCT_ID: result.product_id,
@@ -193,7 +184,6 @@ class _TemporaryGatewayClientMixin:
             CONF_DEVICE_SECRET: result.device_secret,
             CONF_DEVICE_NAME: result.device_name,
             CONF_QR_CODE_DATA: result.short_url,
-            "sub_device_limit": sub_device_limit,
         }
 
         if not gateway_data[CONF_QR_CODE_DATA]:

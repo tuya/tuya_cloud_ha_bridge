@@ -26,7 +26,7 @@
         "title": "配置虚拟网关"
       },
       "bind_gateway": {
-        "description": "网关信息：\n名称：`{device_name}`\n设备 ID：`{device_id}`\n子设备上限：**{sub_device_limit}**\n\n**扫码添加网关后，点击「提交」即可结束配置，并在 App 上给网关添加子设备（请使用不低于7.6.0版本的App扫码添加）**\n\n⚠️ 未点击「提交」直接关闭页面，App 端网关将无法正常使用",
+        "description": "网关信息：\n名称：`{device_name}`\n设备 ID：`{device_id}`\n\n**扫码添加网关后，点击「提交」即可结束配置，并在 App 上给网关添加子设备（请使用不低于7.6.0版本的App扫码添加）**\n\n⚠️ 未点击「提交」直接关闭页面，App 端网关将无法正常使用",
         "title": "扫描绑定二维码",
         "data": {
           "qr_code": "绑定二维码"
@@ -58,7 +58,7 @@
         "title": "虚拟网关"
       },
       "bind_gateway": {
-        "description": "网关信息：\n名称：`{device_name}`\n设备 ID：`{device_id}`\n子设备上限：**{sub_device_limit}**\n\n**扫码添加网关后，点击「提交」即可结束配置，并在 App 上给网关添加子设备（请使用不低于7.6.0版本的App扫码添加）**\n\n⚠️ 未点击「提交」直接关闭页面，App 端网关将无法正常使用",
+        "description": "网关信息：\n名称：`{device_name}`\n设备 ID：`{device_id}`\n\n**扫码添加网关后，点击「提交」即可结束配置，并在 App 上给网关添加子设备（请使用不低于7.6.0版本的App扫码添加）**\n\n⚠️ 未点击「提交」直接关闭页面，App 端网关将无法正常使用",
         "title": "扫描绑定二维码",
         "data": {
           "qr_code": "绑定二维码"

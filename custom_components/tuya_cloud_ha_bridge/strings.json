@@ -26,7 +26,7 @@
         "title": "Set up virtual gateway"
       },
       "bind_gateway": {
-        "description": "Gateway details:\nName: `{device_name}`\nDevice ID: `{device_id}`\nSub-device limit: **{sub_device_limit}**\n\n**After scanning the QR code to add the gateway, select \"Finish\" to complete setup and add sub-devices in the app (please use App version 7.6.0 or above to scan and add)**\n\n⚠️ Closing this page without selecting \"Finish\" will prevent the gateway from functioning properly in the app",
+        "description": "Gateway details:\nName: `{device_name}`\nDevice ID: `{device_id}`\n\n**After scanning the QR code to add the gateway, select \"Finish\" to complete setup and add sub-devices in the app (please use App version 7.6.0 or above to scan and add)**\n\n⚠️ Closing this page without selecting \"Finish\" will prevent the gateway from functioning properly in the app",
         "title": "Scan binding QR code",
         "data": {
           "qr_code": "Binding QR code"
@@ -58,7 +58,7 @@
         "title": "Virtual gateway"
       },
       "bind_gateway": {
-        "description": "Gateway details:\nName: `{device_name}`\nDevice ID: `{device_id}`\nSub-device limit: **{sub_device_limit}**\n\n**After scanning the QR code to add the gateway, select \"Finish\" to complete setup and add sub-devices in the app (please use App version 7.6.0 or above to scan and add)**\n\n⚠️ Closing this page without selecting \"Finish\" will prevent the gateway from functioning properly in the app",
+        "description": "Gateway details:\nName: `{device_name}`\nDevice ID: `{device_id}`\n\n**After scanning the QR code to add the gateway, select \"Finish\" to complete setup and add sub-devices in the app (please use App version 7.6.0 or above to scan and add)**\n\n⚠️ Closing this page without selecting \"Finish\" will prevent the gateway from functioning properly in the app",
         "title": "Scan binding QR code",
         "data": {
           "qr_code": "Binding QR code"

@@ -719,7 +719,39 @@ def pidspec_build_service_calls(
     if route_table is None:
         return None
 
-    return dispatch_tuya_to_ha(route_table, tuya_data, context)
+    return dispatch_tuya_to_ha(
+        route_table, tuya_data, _with_inbound_state(hass, route_table, context)
+    )
+
+
+def _with_inbound_state(
+    hass: HomeAssistant,
+    route_table: DeviceRouteTable,
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Seed *context* with what inbound converters cannot look up themselves.
+
+    A converter's inbound hook only gets (value, config, entity_id, context) —
+    no ``hass``. That is fine while the command carries its own value, but some
+    commands do NOT: a light's ``work_mode`` switch says "go to colour" without
+    saying WHICH colour, and HA has no service that changes color_mode without
+    one. Filling the gap needs either the entity's current attributes (the
+    derived hs_color, so the lamp does not jump) or what we last reported (the
+    colour temperature the user had set before going colour).
+
+    Both live here — this layer holds ``hass`` AND the route table — so they are
+    handed down through ``context``, the same channel ``last_cover_control``
+    already uses for the identical "command without a value" problem.
+    """
+    enriched = dict(context or {})
+    states: dict[str, dict[str, Any]] = {}
+    for eid in route_table.entity_ids:
+        state = hass.states.get(eid)
+        if state is not None:
+            states[eid] = {"state": state.state, "attributes": dict(state.attributes)}
+    enriched["entity_states"] = states
+    enriched["last_reported"] = dict(route_table.last_reported_snapshot or {})
+    return enriched
 
 
 def pidspec_build_properties(
@@ -934,24 +966,29 @@ def _resolve_dp_properties(
     if vmax is not None and cmax is not None:
         vmax = min(vmax, cmax)
 
-        # 与 value 同域:范围也乘 DP scale(value 27.0→270 ⇒ min 17.0→170)。
-        # 读同一个 converter_config["scale"](std:numeric_scale / group:climate_temp)。
-        # 放在 tuya_contract clamp 之后(clamp 在真实度数域比较)。enum range 不动。
-        try:
-            scale = float(cfg.get("scale", 1))
-            if scale <= 0:
-                scale = 1.0
-        except (TypeError, ValueError):
+    # 与 value 同域:范围也乘 DP scale(value 27.0→270 ⇒ min 17.0→170)。
+    # 读同一个 converter_config["scale"](std:numeric_scale / group:climate_temp)。
+    # 放在 tuya_contract clamp 之后(clamp 在真实度数域比较)。enum range 不动。
+    #
+    # 注意:本段曾误缩进在上面的 `if vmax/cmax` 分支内 —— 结果是**只有同时有
+    # 实测 max 和 tuya_contract.max 的 DP 才会声明 min/max/step/unit**,没写
+    # tuya_contract 的 DP(ringtone/volume_set/fan_speed…)声明键形同虚设,
+    # 静默不发范围。tuya_contract 只是可选钳位,不是发声明的前提。
+    try:
+        scale = float(cfg.get("scale", 1))
+        if scale <= 0:
             scale = 1.0
+    except (TypeError, ValueError):
+        scale = 1.0
 
-        if vmin is not None:
-            dp_props["min"] = int(round(vmin * scale)) if scale != 1 else vmin
-        if vmax is not None:
-            dp_props["max"] = int(round(vmax * scale)) if scale != 1 else vmax
-        if step is not None:
-            dp_props["step"] = int(round(step * scale)) if scale != 1 else step
-        if cfg.get("unit") is not None:
-                dp_props["unit"] = cfg["unit"]
+    if vmin is not None:
+        dp_props["min"] = int(round(vmin * scale)) if scale != 1 else vmin
+    if vmax is not None:
+        dp_props["max"] = int(round(vmax * scale)) if scale != 1 else vmax
+    if step is not None:
+        dp_props["step"] = int(round(step * scale)) if scale != 1 else step
+    if cfg.get("unit") is not None and dp_props:
+        dp_props["unit"] = cfg["unit"]
 
     return dp_props or None
 

@@ -116,10 +116,9 @@ class StdNumericScale:
             return int(round(result))
         return round(result, round_digits)
 
-    def _ha_to_tuya(self, ha_value: float, config: dict[str, Any]) -> int | float:
+    def _ha_to_tuya(self, ha_value: float, config: dict[str, Any]) -> int:
         scale = config.get("scale")
         offset = config.get("offset", 0)
-        round_digits = config.get("round_digits", 0)
 
         if scale is not None:
             result = (ha_value - offset) * float(scale)
@@ -137,6 +136,10 @@ class StdNumericScale:
             else:
                 result = (ha_value - offset - ha_min) / ha_range * tuya_range + tuya_min
 
-        if round_digits == 0:
-            return int(round(result))
-        return round(result, round_digits)
+        # A Tuya value DP always carries an INTEGER raw value — that is precisely
+        # why the thing model has a `scale`. So `round_digits` governs only the
+        # HA-side precision (Tuya→HA above); this direction always rounds to int.
+        # Sharing one round_digits across both directions broke fractional HA
+        # attributes: media_player `volume_level` is 0.0-1.0, so it needs
+        # round_digits=2 inbound, which would otherwise emit 35.1 to a value DP.
+        return int(round(result))

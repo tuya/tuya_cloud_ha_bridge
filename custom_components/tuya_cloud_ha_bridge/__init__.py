@@ -2273,6 +2273,16 @@ async def async_publish_eligible_ha_devices(
                 "deviceName": device.name_by_user or device.name or device.id,
                 "deviceType": discovery_result.category_code,
             }
+            # HA registry identity metadata — "name" is the integration-provided
+            # device name (deviceName above may be a user rename). Omit keys the
+            # registry has no value for, same as "area" below.
+            for meta_key, meta_value in (
+                ("name", device.name),
+                ("model", device.model),
+                ("manufacturer", device.manufacturer),
+            ):
+                if meta_value:
+                    ha_device[meta_key] = meta_value
             if device.area_id:
                 area_entry = area_registry.async_get_area(device.area_id)
                 if area_entry is not None:

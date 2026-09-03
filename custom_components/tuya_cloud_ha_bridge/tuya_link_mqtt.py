@@ -366,7 +366,9 @@ class TuyaLinkMqttClient:
         """Publish eligible HA sub-devices for the app to select.
 
         Topic: tylink/${deviceId}/device/list/found
-        Each device dict contains: clientId, productId, deviceName, deviceType.
+        Each device dict contains: clientId, productId, deviceName, deviceType,
+        plus the optional HA registry fields name, model, manufacturer and area
+        (only present when the registry has a value).
         """
         if not self._client or not self._connected:
             _LOGGER.warning("Cannot publish HA devices: not connected")
