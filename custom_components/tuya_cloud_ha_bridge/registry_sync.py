@@ -74,12 +74,15 @@ def _is_excluded_device(
     """Return if a device should be excluded from gateway binding."""
     if _is_virtual_device(device):
         return True
-    for config_entry_id in device.config_entries:
+
+    config_entry_id = device.config_entry_id
+    if config_entry_id is not None:
         domain = _async_entry_domain(hass, config_entry_id)
         if domain == "tuya":
             return True
         if domain == DOMAIN and config_entry_id != target_entry_id:
             return True
+
     return False
 
 
@@ -178,7 +181,7 @@ async def async_sync_gateway_devices(
         }
         # Associate the device with this config entry so it appears on the
         # integration page.
-        if entry.entry_id not in device.config_entries:
+        if device.config_entry_id != entry.entry_id:
             device_registry.async_update_device(
                 device.id,
                 add_config_entry_id=entry.entry_id,
