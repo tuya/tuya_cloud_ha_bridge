@@ -1068,7 +1068,7 @@ async def async_handle_subdevice_bind_response(
             }
 
         # Associate config entry with the device
-        if entry.entry_id not in device.config_entries:
+        if device.config_entry_id != entry.entry_id:
             device_registry.async_update_device(
                 device.id,
                 add_config_entry_id=entry.entry_id,
@@ -1787,7 +1787,7 @@ async def async_handle_topo_get_response(
                 # Ensure the HA device is associated with this config entry
                 # so it appears on the integration page.
                 device = device_registry.async_get(client_id)
-                if device is not None and entry.entry_id not in device.config_entries:
+                if device is not None and device.config_entry_id != entry.entry_id:
                     device_registry.async_update_device(
                         device.id,
                         add_config_entry_id=entry.entry_id,
@@ -1933,7 +1933,7 @@ async def async_handle_topo_get_response(
             }
 
         # Associate config entry with the device.
-        if entry.entry_id not in device.config_entries:
+        if device.config_entry_id != entry.entry_id:
             device_registry.async_update_device(
                 device.id,
                 add_config_entry_id=entry.entry_id,
@@ -1988,7 +1988,7 @@ async def async_handle_topo_get_response(
         runtime_data.publish_subdevice_delete(restore_unbind_tuya_ids)
         for ha_device_id in dict.fromkeys(restore_unbind_ha_device_ids):
             stale_device = device_registry.async_get(ha_device_id)
-            if stale_device is not None and entry.entry_id in stale_device.config_entries:
+            if stale_device is not None and stale_device.config_entry_id == entry.entry_id:
                 device_registry.async_update_device(
                     stale_device.id,
                     remove_config_entry_id=entry.entry_id,
@@ -2093,7 +2093,7 @@ async def async_handle_topo_get_response(
     )
     orphan_count = 0
     for device in list(device_registry.devices.values()):
-        if entry.entry_id not in device.config_entries:
+        if device.config_entry_id != entry.entry_id:
             continue
         if device.id in bound_ha_ids or device.id in pending_ha_ids:
             continue
@@ -2150,7 +2150,7 @@ def _compute_device_fingerprints(
     for device in device_registry.devices.values():
         if _is_excluded_device(hass, device, entry.entry_id):
             continue
-        if entry.entry_id in device.config_entries:
+        if device.config_entry_id == entry.entry_id:
             continue  # already bound to this gateway — not re-inferred
         has_available = False
         entity_parts: list[str] = []
@@ -2229,7 +2229,7 @@ async def async_publish_eligible_ha_devices(
             continue
         # Skip devices already bound to this gateway — they are not candidates
         # for (re-)binding and don't need re-inference / low-confidence report.
-        if entry.entry_id in device.config_entries:
+        if device.config_entry_id == entry.entry_id:
             continue
 
         # Collect all entity domains for this device.
