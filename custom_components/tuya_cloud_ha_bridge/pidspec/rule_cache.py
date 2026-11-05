@@ -127,6 +127,16 @@ def _parse_dp_definitions(
     return defs
 
 
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Coerce a bundle number, which the cloud may wrap as {"Value": n}."""
+    if isinstance(value, dict):
+        value = value.get("Value", value.get("value", default))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _parse_disambiguate(raw: dict[str, Any] | None):
     """Parse the disambiguate section into a DisambiguateHints object, or None."""
     if raw is None:
@@ -137,7 +147,7 @@ def _parse_disambiguate(raw: dict[str, Any] | None):
         name_keywords=raw.get("name_keywords", []),
         positive_attrs=set(raw.get("positive_attrs", [])),
         negative_attrs=set(raw.get("negative_attrs", [])),
-        weight=float(raw.get("weight", 0.0)),
+        weight=_as_float(raw.get("weight"), 0.0),
         # NOTE: bundle.py carries a second copy of this parser — keep the
         # accepted keys in sync (they have already drifted once, silently
         # dropping required_device_classes and breaking the identity gate).
@@ -182,8 +192,8 @@ def _parse_pidspecs(raw_list: list[dict[str, Any]]) -> list[PidSpec]:
                 ),
                 disambiguate=_parse_disambiguate(item.get("disambiguate")),
                 ignore_domains=frozenset(item.get("ignore_domains", [])),
-                min_domain_coverage=float(
-                    item.get("min_domain_coverage", 0.5)
+                min_domain_coverage=_as_float(
+                    item.get("min_domain_coverage"), 0.5
                 ),
             )
             specs.append(spec)
